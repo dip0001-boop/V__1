@@ -11,25 +11,29 @@ class MemoryStore:
         self,
         path="verdant_memory.json",
     ):
-
         self.path = Path(
             path
         )
 
-        self.lock = (
-            threading.RLock()
-        )
+        self.lock = threading.RLock()
 
         self.data = {
             "chats": {},
+
             "learning": {
                 "sessions": [],
                 "seen_sources": [],
                 "replay": [],
+                "weaknesses": [],
+                "outcomes": [],
             },
         }
 
         self._load()
+
+    # =========================================================
+    # Persistence
+    # =========================================================
 
     def _load(self):
 
@@ -44,28 +48,59 @@ class MemoryStore:
                 )
             )
 
-            if isinstance(
+            if not isinstance(
                 loaded,
                 dict,
             ):
-                self.data.update(
-                    loaded
+                return
+
+            chats = loaded.get(
+                "chats"
+            )
+
+            if isinstance(
+                chats,
+                dict,
+            ):
+                self.data[
+                    "chats"
+                ] = chats
+
+            learning = loaded.get(
+                "learning"
+            )
+
+            if isinstance(
+                learning,
+                dict,
+            ):
+
+                self.data[
+                    "learning"
+                ].update(
+                    learning
                 )
 
         except Exception:
+            # Corrupt memory must not prevent boot.
             pass
 
     def save(self):
 
         with self.lock:
 
-            temp = (
+            self.path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            temporary = (
                 self.path.with_suffix(
                     ".tmp"
                 )
             )
 
-            temp.write_text(
+            temporary.write_text(
                 json.dumps(
                     self.data,
                     ensure_ascii=False,
@@ -74,9 +109,13 @@ class MemoryStore:
                 encoding="utf-8",
             )
 
-            temp.replace(
+            temporary.replace(
                 self.path
             )
+
+    # =========================================================
+    # Chat memory
+    # =========================================================
 
     def chat(
         self,
@@ -102,10 +141,16 @@ class MemoryStore:
 
         self.chat(
             chat_id
-        )["messages"].append(
+        )[
+            "messages"
+        ].append(
             {
-                "role": role,
-                "content": content,
+                "role": str(
+                    role
+                ),
+                "content": str(
+                    content
+                ),
             }
         )
 
@@ -119,42 +164,60 @@ class MemoryStore:
 
         self.chat(
             chat_id
-        )["summary"] = summary
+        )[
+            "summary"
+        ] = str(
+            summary
+        )
 
         self.save()
+
+    # =========================================================
+    # Replay
+    # =========================================================
 
     def add_replay(
         self,
         example,
         priority=1.0,
     ):
-
         learning = self.data[
             "learning"
         ]
 
-        learning.setdefault(
+        replay = learning.setdefault(
             "replay",
-            []
+            [],
         )
 
-        learning[
-            "replay"
-        ].append(
+        replay.append(
             {
-                "example":
-                    example,
-                "priority":
-                    float(priority),
+                "example": str(
+                    example
+                ),
+                "priority": float(
+                    priority
+                ),
             }
         )
 
-        # Keep persistent replay bounded.
+        # Bound persistent replay.
+        #
+        # Keep the highest-value examples,
+        # rather than blindly keeping the latest.
+        replay.sort(
+            key=lambda item: float(
+                item.get(
+                    "priority",
+                    1.0,
+                )
+            ),
+            reverse=True,
+        )
+
         learning[
             "replay"
-        ] = learning[
-            "replay"
-        ][-2000:]
+        ] = replay[:4000]
 
     def replay_examples(
         self,
@@ -173,17 +236,132 @@ class MemoryStore:
 
         ordered = sorted(
             replay,
-            key=lambda item:
+            key=lambda item: float(
                 item.get(
                     "priority",
                     1.0,
-                ),
+                )
+            ),
             reverse=True,
         )
 
-        return [
-            item["example"]
-            for item in ordered[
-                :maximum
-            ]
+        result = []
+
+        for item in ordered:
+
+            example = item.get(
+                "example"
+            )
+
+            if not example:
+                continue
+
+            result.append(
+                str(
+                    example
+                )
+            )
+
+            if len(result) >= maximum:
+                break
+
+        return result
+
+    # =========================================================
+    # Learning history
+    # =========================================================
+
+    def learning_history(
+        self,
+    ):
+        return self.data[
+            "learning"
         ]
+
+    def record_outcome(
+        self,
+        goal,
+        accepted,
+        validation_before,
+        validation_after,
+        retention_before,
+        retention_after,
+        transfer,
+    ):
+
+        outcomes = self.data[
+            "learning"
+        ].setdefault(
+            "outcomes",
+            [],
+        )
+
+        outcomes.append(
+            {
+                "goal": str(
+                    goal
+                ),
+                "accepted": bool(
+                    accepted
+                ),
+                "validation_before": (
+                    validation_before
+                ),
+                "validation_after": (
+                    validation_after
+                ),
+                "retention_before": (
+                    retention_before
+                ),
+                "retention_after": (
+                    retention_after
+                ),
+                "transfer": transfer,
+            }
+        )
+
+        self.data[
+            "learning"
+        ][
+            "outcomes"
+        ] = outcomes[-2000:]
+
+    def record_weakness(
+        self,
+        target,
+        severity,
+    ):
+
+        weaknesses = self.data[
+            "learning"
+        ].setdefault(
+            "weaknesses",
+            [],
+        )
+
+        weaknesses.append(
+            {
+                "target": str(
+                    target
+                ),
+                "severity": float(
+                    severity
+                ),
+            }
+        )
+
+        weaknesses.sort(
+            key=lambda item: float(
+                item.get(
+                    "severity",
+                    0.0,
+                )
+            ),
+            reverse=True,
+        )
+
+        self.data[
+            "learning"
+        ][
+            "weaknesses"
+        ] = weaknesses[:1000]
