@@ -15,10 +15,6 @@ from summary import summarize
 from trainer import Trainer
 
 
-# ============================================================
-# APP
-# ============================================================
-
 app = FastAPI(
     title="Verdant-1.0",
     version="1.0.0",
@@ -26,17 +22,6 @@ app = FastAPI(
 
 ROOT = Path(__file__).resolve().parent
 
-
-# ============================================================
-# STATIC FILES
-# ============================================================
-
-# Serves:
-#   /static/app.js
-#   /static/styles.css
-#
-# This fixes the Render 404 problem caused by the old
-# /app.js and /styles.css routes.
 app.mount(
     "/static",
     StaticFiles(directory=ROOT),
@@ -44,94 +29,33 @@ app.mount(
 )
 
 
-# ============================================================
-# MODEL / MEMORY / TRAINER
-# ============================================================
+store = ModelStore(ROOT / "verdant_state.pt")
+memory = MemoryStore(ROOT / "verdant_memory.json")
+trainer = Trainer(store, memory)
 
-MODEL_PATH = ROOT / "verdant_state.pt"
-MEMORY_PATH = ROOT / "verdant_memory.json"
-
-store = ModelStore(MODEL_PATH)
-memory = MemoryStore(MEMORY_PATH)
-trainer = Trainer(
-    store,
-    memory,
-)
-
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
 
 class ChatRequest(BaseModel):
-    message: str = Field(
-        min_length=1,
-        max_length=12000,
-    )
-
+    message: str = Field(min_length=1, max_length=12000)
     chat_id: str | None = None
-
     effort: str = "medium"
 
 
 class TrainRequest(BaseModel):
-    goal: str = Field(
-        min_length=2,
-        max_length=300,
-    )
-
-    minutes: float = Field(
-        default=20,
-        ge=1,
-        le=120,
-    )
+    goal: str = Field(min_length=2, max_length=300)
+    minutes: float = Field(default=20, ge=1, le=120)
 
 
-# ============================================================
-# FRONTEND ROUTES
-# ============================================================
-
-@app.get(
-    "/",
-    include_in_schema=False,
-)
+@app.get("/", include_in_schema=False)
+@app.head("/", include_in_schema=False)
 def index():
-    path = ROOT / "index.html"
+    return FileResponse(ROOT / "index.html")
 
-    if not path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="index.html not found",
-        )
-
-    return FileResponse(path)
-
-
-@app.head(
-    "/",
-    include_in_schema=False,
-)
-def index_head():
-    path = ROOT / "index.html"
-
-    if not path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="index.html not found",
-        )
-
-    return FileResponse(path)
-
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
-        "step": store.step,
+        "model_step": store.step,
         "parameters": store.parameter_count(),
     }
 
@@ -145,53 +69,18 @@ def status():
     }
 
 
-# ============================================================
-# EFFORT
-# ============================================================
-
-def _effort_config(
-    effort: str,
-) -> tuple[int, float]:
-    """
-    Runtime-only inference settings.
-
-    These settings control how much computation/output is used.
-    They are not intelligence rules.
-    """
-
-    configs = {
-        "lite": (
-            80,
-            0.90,
-        ),
-
-        "medium": (
-            140,
-            0.82,
-        ),
-
-        "max": (
-            220,
-            0.72,
-        ),
-    }
-
-    return configs.get(
+def effort_config(effort: str) -> tuple[int, float]:
+    return {
+        "lite": (96, 0.95),
+        "medium": (160, 0.85),
+        "max": (256, 0.72),
+    }.get(
         (effort or "medium").lower(),
-        configs["medium"],
+        (160, 0.85),
     )
 
 
-# ============================================================
-# MODEL SAMPLING
-# ============================================================
-
-def _sample(
-    prompt: str,
-    max_new: int,
-    temperature: float,
-) -> str:
-
+def sample(prompt: str, max_new: int, temperature: float) -> str:
     tokenizer = store.tokenizer
 
     ids = tokenizer.encode(
@@ -208,44 +97,30 @@ def _sample(
     )
 
     generated: list[int] = []
-
     hidden = None
 
     store.model.eval()
 
     with torch.no_grad():
-
-        # Prime the model with the prompt.
-        logits, hidden = store.model(
-            x,
-            hidden,
-        )
-
+        logits, hidden = store.model(x, hidden)
         last = x[:, -1:]
 
         for _ in range(max_new):
-
-            logits, hidden = store.model(
-                last,
-                hidden,
-            )
+            logits, hidden = store.model(last, hidden)
 
             next_logits = (
                 logits[:, -1, :]
-                / max(
-                    0.25,
-                    temperature,
-                )
+                / max(0.25, temperature)
             )
 
-            probabilities = torch.softmax(
+            probs = torch.softmax(
                 next_logits,
                 dim=-1,
             )
 
-            # Nucleus-style stochastic sampling.
+            # Nucleus sampling.
             values, indices = torch.sort(
-                probabilities,
+                probs,
                 descending=True,
             )
 
@@ -255,22 +130,18 @@ def _sample(
             )
 
             keep = cumulative <= 0.92
-
-            # Always retain at least the best token.
             keep[..., 0] = True
 
             values = values * keep
 
-            total = values.sum(
+            values = values / values.sum(
                 dim=-1,
                 keepdim=True,
             )
 
-            values = values / total
-
             picked = torch.multinomial(
                 values,
-                num_samples=1,
+                1,
             )
 
             next_token = indices.gather(
@@ -278,12 +149,8 @@ def _sample(
                 picked,
             )
 
-            token_id = int(
-                next_token.item()
-            )
-
             generated.append(
-                token_id
+                int(next_token.item())
             )
 
             last = next_token
@@ -293,108 +160,77 @@ def _sample(
     ).strip()
 
 
-# ============================================================
-# CHAT
-# ============================================================
-
 @app.post("/api/chat")
-def chat(
-    request: ChatRequest,
-):
-    chat_id = (
-        request.chat_id
-        or str(uuid.uuid4())
-    )
+def chat(request: ChatRequest):
+    chat_id = request.chat_id or str(uuid.uuid4())
 
-    # Get the existing conversation.
-    conversation = memory.chat(
-        chat_id
-    )
+    conversation = memory.chat(chat_id)
 
-    # Store the user's message.
+    recent = conversation["messages"][-10:]
+
     memory.add_message(
         chat_id,
         "user",
         request.message,
     )
 
-    # Use recent conversation context.
-    recent_messages = conversation[
-        "messages"
-    ][-8:]
-
     context = "\n".join(
-        (
-            f"{message['role'].title()}: "
-            f"{message['content']}"
-        )
-        for message in recent_messages
+        f"{m['role'].title()}: {m['content']}"
+        for m in recent
     )
 
-    max_new, temperature = (
-        _effort_config(
-            request.effort
-        )
+    max_new, temperature = effort_config(
+        request.effort
     )
 
     prompt = (
         context
+        + "\nUser: "
+        + request.message
         + "\nAssistant:"
     )
 
     try:
-        answer = _sample(
-            prompt=prompt,
-            max_new=max_new,
-            temperature=temperature,
+        answer = sample(
+            prompt,
+            max_new,
+            temperature,
         )
-
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Inference failed: {exc}",
         ) from exc
 
-    # Store Atlas's response.
     memory.add_message(
         chat_id,
         "assistant",
         answer,
     )
 
-    updated_conversation = memory.chat(
-        chat_id
-    )
+    updated = memory.chat(chat_id)
 
-    # Update the conversation summary.
-    conversation_summary = summarize(
-        updated_conversation["messages"]
+    summary = summarize(
+        updated["messages"]
     )
 
     memory.set_summary(
         chat_id,
-        conversation_summary,
+        summary,
     )
 
     return {
         "chat_id": chat_id,
         "response": answer,
-        "summary": conversation_summary,
+        "summary": summary,
         "effort": request.effort,
         "training_step": store.step,
     }
 
 
-# ============================================================
-# TRAINING
-# ============================================================
-
 @app.post("/api/train/start")
-def start_training(
-    request: TrainRequest,
-):
+def start_training(request: TrainRequest):
     try:
-
         trainer.start(
             request.goal,
             request.minutes,
@@ -407,7 +243,6 @@ def start_training(
         }
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=409,
             detail=str(exc),
