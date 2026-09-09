@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from pathlib import Path
 import random
 import re
 import threading
@@ -18,50 +17,66 @@ class Status:
     running: bool = False
     goal: str = ""
     phase: str = "idle"
+
     elapsed: float = 0.0
     requested_minutes: float = 20.0
 
     steps: int = 0
-    loss: float | None = None
-    val_loss: float | None = None
+    cycles: int = 0
 
-    mastery: float | None = None
+    train_loss: float | None = None
+    val_loss: float | None = None
     baseline_loss: float | None = None
     improvement: float | None = None
 
     sources: int = 0
-    cycles: int = 0
-    assessment: str = ""
+    examples: int = 0
+
+    mastery: float | None = None
+
     next_focus: str = ""
+
     message: str = ""
+    last_evaluation: str = ""
 
 
 class Trainer:
+
     def __init__(
         self,
         store,
         memory,
     ):
+
         self.store = store
         self.memory = memory
 
         self.status = Status()
 
-        self.thread: threading.Thread | None = None
+        self.thread = None
         self.stop_event = threading.Event()
 
         self.lock = threading.RLock()
 
+        self.rng = random.Random()
+
     def snapshot(self):
+
         with self.lock:
-            return asdict(self.status)
+            return asdict(
+                self.status
+            )
 
     def start(
         self,
-        goal: str,
-        minutes: float = 20,
+        goal,
+        minutes=20,
     ):
+
+        goal = goal.strip()
+
         with self.lock:
+
             if self.status.running:
                 raise RuntimeError(
                     "A training session is already running."
@@ -71,26 +86,27 @@ class Trainer:
 
             self.status = Status(
                 running=True,
-                goal=goal.strip(),
-                requested_minutes=float(
-                    max(
-                        1,
-                        min(
-                            120,
-                            minutes,
-                        ),
-                    )
+                goal=goal,
+                requested_minutes=max(
+                    1.0,
+                    min(
+                        120.0,
+                        float(minutes),
+                    ),
                 ),
-                phase="baseline",
-                message="Measuring the current model.",
+                phase="research",
+                message=(
+                    "Starting real training."
+                ),
+            )
+
+            requested = (
+                self.status.requested_minutes
             )
 
         self.thread = threading.Thread(
             target=self._run,
-            args=(
-                goal.strip(),
-                self.status.requested_minutes,
-            ),
+            args=(goal, requested),
             daemon=True,
         )
 
@@ -99,19 +115,37 @@ class Trainer:
     def halt(self):
         self.stop_event.set()
 
-    # ---------------------------------------------------------
-    # Dataset construction
-    # ---------------------------------------------------------
+    # ========================================================
+    # DATA
+    # ========================================================
 
-    def _build_examples(
+    def _extract_sentences(
         self,
-        goal: str,
-        docs: list[dict],
-    ) -> list[str]:
+        text,
+    ):
 
-        examples: list[str] = []
+        pieces = re.split(
+            r"(?<=[.!?])\s+",
+            text or "",
+        )
 
-        for document in docs:
+        return [
+            piece.strip()
+            for piece in pieces
+            if 60 <= len(piece.strip()) <= 900
+        ]
+
+    def _build_dataset(
+        self,
+        goal,
+        documents,
+    ):
+
+        examples = []
+
+        # Raw source learning.
+        for document in documents:
+
             title = document.get(
                 "title",
                 "",
@@ -125,179 +159,167 @@ class Trainer:
             if not text:
                 continue
 
-            # Train the model to continue coherent prose
-            # from researched material.
             examples.append(
-                f"Topic: {title}\n{text}"
+                f"Learning goal: {goal}\n"
+                f"Source: {title}\n"
+                f"{text}"
             )
 
-        # General conversational training.
-        # These are training examples, not runtime response rules.
+            sentences = (
+                self._extract_sentences(
+                    text
+                )
+            )
+
+            for sentence in sentences[:40]:
+
+                examples.append(
+                    f"Goal: {goal}\n"
+                    f"Concept: {sentence}\n"
+                    f"Explanation: {sentence}"
+                )
+
+        # General dialogue training.
         examples.extend(
             [
-                "User: hello\n"
-                "Assistant: Hello! What would you like to talk about?",
-
-                "User: hi\n"
-                "Assistant: Hi! What are you working on?",
-
-                "User: how are you?\n"
-                "Assistant: I'm ready to help. What would you like to explore?",
-
-                "User: what are you?\n"
-                "Assistant: I am Verdant-1.0, a learned AI system.",
-
-                "User: explain something simply\n"
-                "Assistant: Start with the central idea, then connect the important details.",
+                (
+                    "User: hello\n"
+                    "Assistant: Hello! "
+                    "What would you like to explore?"
+                ),
+                (
+                    "User: hi\n"
+                    "Assistant: Hi! "
+                    "What are you working on?"
+                ),
+                (
+                    "User: how are you?\n"
+                    "Assistant: I'm ready to help. "
+                    "What would you like to talk about?"
+                ),
+                (
+                    "User: explain something simply\n"
+                    "Assistant: Start with the central idea, "
+                    "then connect the important details."
+                ),
             ]
         )
 
-        # Goal-specific instructional examples.
-        examples.extend(
-            self._goal_examples(
-                goal,
-                docs,
-            )
-        )
-
-        return examples
-
-    def _goal_examples(
-        self,
-        goal: str,
-        docs: list[dict],
-    ) -> list[str]:
-
-        result: list[str] = []
-
-        extracted = []
-
-        for document in docs:
-            text = document.get(
-                "text",
-                "",
-            )
-
-            sentences = re.split(
-                r"(?<=[.!?])\s+",
-                text,
-            )
-
-            for sentence in sentences:
-                sentence = sentence.strip()
-
-                if 80 <= len(sentence) <= 700:
-                    extracted.append(
-                        sentence
-                    )
-
-        # Limit duplicate material.
+        unique = []
         seen = set()
 
-        for sentence in extracted:
-            key = sentence.lower()
+        for example in examples:
 
-            if key in seen:
+            normalized = re.sub(
+                r"\s+",
+                " ",
+                example,
+            ).strip().lower()
+
+            if normalized in seen:
                 continue
 
-            seen.add(key)
+            seen.add(normalized)
+            unique.append(example)
 
-            result.append(
-                f"Goal: {goal}\n"
-                f"Learned concept: {sentence}"
-            )
+        self.rng.shuffle(unique)
 
-            if len(result) >= 160:
-                break
+        return unique
 
-        return result
-
-    def _split_holdout(
+    def _split(
         self,
-        examples: list[str],
+        examples,
     ):
-        rng = random.Random(2026)
 
-        shuffled = list(examples)
-        rng.shuffle(shuffled)
+        examples = list(examples)
 
-        holdout_count = max(
-            24,
-            min(
-                96,
-                len(shuffled) // 5,
-            ),
+        self.rng.shuffle(
+            examples
         )
 
-        holdout = shuffled[
-            :holdout_count
-        ]
+        if len(examples) < 20:
+            split = max(
+                1,
+                len(examples) // 4,
+            )
+        else:
+            split = max(
+                20,
+                min(
+                    120,
+                    len(examples) // 5,
+                ),
+            )
 
-        training = shuffled[
-            holdout_count:
-        ]
+        holdout = examples[:split]
+        training = examples[split:]
 
         return training, holdout
 
-    # ---------------------------------------------------------
-    # Batching
-    # ---------------------------------------------------------
+    # ========================================================
+    # BATCHES
+    # ========================================================
 
-    def _make_batch(
+    def _batch(
         self,
-        examples: list[str],
-        batch_size: int = 8,
-        sequence_length: int = 256,
+        examples,
+        batch_size=8,
+        sequence_length=384,
     ):
 
-        xs = []
-        ys = []
+        encoded_examples = []
 
-        usable = [
-            example
-            for example in examples
-            if len(example.encode("utf-8")) >= 8
-        ]
+        for example in examples:
 
-        if not usable:
-            raise RuntimeError(
-                "No usable training examples."
-            )
-
-        for _ in range(batch_size):
-
-            text = random.choice(
-                usable
-            )
-
-            encoded = text.encode(
+            raw = example.encode(
                 "utf-8",
                 errors="replace",
             )
 
-            if len(encoded) < sequence_length + 1:
-                repeats = (
-                    sequence_length + 1
-                ) // max(
-                    1,
-                    len(encoded),
-                ) + 1
+            if len(raw) >= 16:
+                encoded_examples.append(raw)
 
-                encoded *= repeats
-
-            start = random.randint(
-                0,
-                len(encoded)
-                - sequence_length
-                - 1,
+        if not encoded_examples:
+            raise RuntimeError(
+                "No valid training examples."
             )
 
-            x = encoded[
+        xs = []
+        ys = []
+
+        for _ in range(
+            batch_size
+        ):
+
+            raw = self.rng.choice(
+                encoded_examples
+            )
+
+            if len(raw) < sequence_length + 1:
+
+                repeat_count = (
+                    sequence_length + 1
+                ) // len(raw) + 1
+
+                raw = raw * repeat_count
+
+            maximum = (
+                len(raw)
+                - sequence_length
+                - 1
+            )
+
+            start = self.rng.randint(
+                0,
+                maximum,
+            )
+
+            x = raw[
                 start:
                 start + sequence_length
             ]
 
-            y = encoded[
+            y = raw[
                 start + 1:
                 start + sequence_length + 1
             ]
@@ -321,9 +343,9 @@ class Trainer:
             ),
         )
 
-    # ---------------------------------------------------------
-    # Real learning
-    # ---------------------------------------------------------
+    # ========================================================
+    # REAL TRAINING
+    # ========================================================
 
     def _train_step(
         self,
@@ -332,7 +354,7 @@ class Trainer:
 
         self.store.model.train()
 
-        x, y = self._make_batch(
+        x, y = self._batch(
             examples
         )
 
@@ -358,7 +380,7 @@ class Trainer:
 
             torch.nn.utils.clip_grad_norm_(
                 self.store.model.parameters(),
-                1.0,
+                max_norm=1.0,
             )
 
             self.store.optimizer.step()
@@ -372,41 +394,41 @@ class Trainer:
     def _evaluate(
         self,
         examples,
-        max_examples: int = 32,
+        maximum=40,
     ):
+
         if not examples:
             return None
 
         selected = examples[
-            :max_examples
+            :maximum
         ]
 
-        total_loss = 0.0
-        count = 0
-
         self.store.model.eval()
+
+        losses = []
 
         with torch.no_grad():
 
             for example in selected:
 
-                encoded = example.encode(
+                raw = example.encode(
                     "utf-8",
                     errors="replace",
                 )
 
-                if len(encoded) < 8:
+                if len(raw) < 8:
                     continue
 
                 sequence_length = min(
-                    256,
-                    len(encoded) - 1,
+                    384,
+                    len(raw) - 1,
                 )
 
                 x = torch.tensor(
                     [
                         list(
-                            encoded[
+                            raw[
                                 :sequence_length
                             ]
                         )
@@ -417,7 +439,7 @@ class Trainer:
                 y = torch.tensor(
                     [
                         list(
-                            encoded[
+                            raw[
                                 1:
                                 sequence_length + 1
                             ]
@@ -438,41 +460,109 @@ class Trainer:
                     y.reshape(-1),
                 )
 
-                total_loss += float(
-                    loss
+                losses.append(
+                    float(loss)
                 )
 
-                count += 1
-
-        if count == 0:
+        if not losses:
             return None
 
-        return total_loss / count
+        return sum(losses) / len(losses)
 
-    # ---------------------------------------------------------
-    # Capability measurement
-    # ---------------------------------------------------------
+    # ========================================================
+    # ADAPTIVE LEARNING
+    # ========================================================
+
+    def _choose_focus(
+        self,
+        goal,
+        documents,
+    ):
+
+        terms = set(
+            re.findall(
+                r"[A-Za-z]{5,}",
+                goal.lower(),
+            )
+        )
+
+        candidates = []
+
+        for document in documents:
+
+            title = document.get(
+                "title",
+                "",
+            )
+
+            text = document.get(
+                "text",
+                "",
+            )
+
+            score = 0
+
+            lower = (
+                title + " " + text[:4000]
+            ).lower()
+
+            for term in terms:
+
+                if term in lower:
+                    score += 1
+
+            candidates.append(
+                (
+                    score,
+                    title,
+                )
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+            )
+        )
+
+        titles = [
+            title
+            for _, title
+            in candidates
+            if title
+        ]
+
+        if titles:
+
+            return (
+                f"{goal} "
+                f"fundamentals "
+                f"examples "
+                f"{' '.join(titles[-3:])}"
+            )
+
+        return (
+            f"{goal} fundamentals examples"
+        )
 
     def _mastery(
         self,
-        baseline_loss,
-        validation_loss,
+        baseline,
+        validation,
     ):
 
         if (
-            baseline_loss is None
-            or validation_loss is None
+            baseline is None
+            or validation is None
         ):
-            return 0.0
+            return None
 
-        # Positive improvement against unseen material.
         improvement = (
-            baseline_loss
-            - validation_loss
+            baseline
+            - validation
         )
 
-        # Convert that improvement into a bounded score.
-        score = (
+        normalized = (
             0.5
             + improvement / 4.0
         )
@@ -481,87 +571,41 @@ class Trainer:
             0.0,
             min(
                 1.0,
-                score,
+                normalized,
             ),
         )
 
-    def _weak_focus(
-        self,
-        goal: str,
-        docs: list[dict],
-    ):
-
-        corpus = " ".join(
-            document.get(
-                "text",
-                "",
-            )
-            for document in docs
-        )
-
-        words = [
-            word
-            for word in re.findall(
-                r"[A-Za-z]{4,}",
-                corpus,
-            )
-        ]
-
-        if not words:
-            return goal
-
-        counts = {}
-
-        for word in words:
-            key = word.lower()
-            counts[key] = (
-                counts.get(key, 0)
-                + 1
-            )
-
-        uncommon = sorted(
-            counts,
-            key=counts.get,
-        )
-
-        return (
-            f"{goal} "
-            + " ".join(
-                uncommon[:8]
-            )
-        )
-
-    # ---------------------------------------------------------
-    # Training session
-    # ---------------------------------------------------------
+    # ========================================================
+    # SESSION
+    # ========================================================
 
     def _run(
         self,
-        goal: str,
-        minutes: float,
+        goal,
+        minutes,
     ):
 
         started = time.time()
 
         try:
 
-            # ---------------------------------------------
-            # Research
-            # ---------------------------------------------
-
             with self.lock:
-                self.status.phase = (
-                    "research"
+                self.status.phase = "research"
+                self.status.message = (
+                    "Researching material related to the goal."
                 )
 
-                self.status.message = (
-                    "Finding new material related to the goal."
-                )
+            learning = self.memory.data.setdefault(
+                "learning",
+                {
+                    "sessions": [],
+                    "skills": {},
+                    "seen_sources": [],
+                },
+            )
 
             seen = set(
-                self.memory.data[
-                    "learning"
-                ].get(
+                learning.get(
                     "seen_sources",
                     [],
                 )
@@ -574,63 +618,57 @@ class Trainer:
             )
 
             for document in documents:
+
                 seen.add(
                     document[
                         "title"
                     ].lower()
                 )
 
-            self.memory.data[
-                "learning"
-            ][
+            learning[
                 "seen_sources"
             ] = list(seen)[-1000:]
 
             self.memory.save()
 
-            # ---------------------------------------------
-            # Dataset
-            # ---------------------------------------------
-
-            examples = self._build_examples(
-                goal,
-                documents,
+            examples = (
+                self._build_dataset(
+                    goal,
+                    documents,
+                )
             )
 
             training_examples, holdout = (
-                self._split_holdout(
+                self._split(
                     examples
                 )
             )
 
-            # ---------------------------------------------
-            # Baseline
-            # ---------------------------------------------
-
-            baseline_loss = self._evaluate(
+            baseline = self._evaluate(
                 holdout
             )
 
             with self.lock:
+
                 self.status.baseline_loss = (
-                    baseline_loss
+                    baseline
                 )
 
-                self.status.sources = len(
-                    documents
+                self.status.sources = (
+                    len(documents)
+                )
+
+                self.status.examples = (
+                    len(examples)
                 )
 
                 self.status.phase = (
-                    "learn"
+                    "learning"
                 )
 
                 self.status.message = (
-                    "Running real learning updates."
+                    "Applying real optimizer updates."
                 )
-
-            # ---------------------------------------------
-            # Main training loop
-            # ---------------------------------------------
 
             deadline = (
                 started
@@ -646,9 +684,9 @@ class Trainer:
 
                 cycle += 1
 
-                cycle_losses = []
+                losses = []
 
-                # Bounded chunk so status remains responsive.
+                # Actual gradient updates.
                 for _ in range(48):
 
                     if (
@@ -657,79 +695,89 @@ class Trainer:
                     ):
                         break
 
-                    cycle_losses.append(
+                    losses.append(
                         self._train_step(
                             training_examples
                         )
                     )
 
-                validation_loss = (
-                    self._evaluate(
-                        holdout
-                    )
+                validation = self._evaluate(
+                    holdout
+                )
+
+                train_loss = (
+                    sum(losses)
+                    / len(losses)
+                    if losses
+                    else None
                 )
 
                 mastery = self._mastery(
-                    baseline_loss,
-                    validation_loss,
-                )
-
-                average_loss = (
-                    sum(cycle_losses)
-                    / max(
-                        1,
-                        len(cycle_losses),
-                    )
+                    baseline,
+                    validation,
                 )
 
                 improvement = (
                     None
                     if (
-                        baseline_loss is None
-                        or validation_loss is None
+                        baseline is None
+                        or validation is None
                     )
-                    else
-                    baseline_loss
-                    - validation_loss
+                    else baseline - validation
                 )
 
                 with self.lock:
+
                     self.status.cycles = cycle
+
                     self.status.steps = (
                         self.store.step
                     )
-                    self.status.loss = (
-                        average_loss
+
+                    self.status.train_loss = (
+                        train_loss
                     )
+
                     self.status.val_loss = (
-                        validation_loss
+                        validation
                     )
+
                     self.status.mastery = (
                         mastery
                     )
+
                     self.status.improvement = (
                         improvement
                     )
+
                     self.status.elapsed = (
                         time.time()
                         - started
                     )
 
-                # Persist every cycle.
+                    self.status.message = (
+                        f"Cycle {cycle}: "
+                        f"{len(losses)} real updates"
+                    )
+
                 self.store.save()
 
-                # -----------------------------------------
-                # Adaptive remediation
-                # -----------------------------------------
+                # Every second cycle, adapt the research target
+                # based on the current training state.
+                if (
+                    mastery is not None
+                    and mastery < 0.80
+                    and cycle % 2 == 0
+                    and time.time() < deadline
+                ):
 
-                if mastery < 0.80:
-
-                    focus = self._weak_focus(
+                    focus = self._choose_focus(
                         goal,
                         documents,
                     )
 
                     with self.lock:
+
                         self.status.phase = (
                             "remediation"
                         )
@@ -739,60 +787,59 @@ class Trainer:
                         )
 
                         self.status.message = (
-                            "Finding additional material for weak areas."
+                            "Weak held-out performance; researching another focus."
                         )
 
-                    extra_documents = (
-                        research_goal(
-                            focus,
-                            limit=6,
-                            seen_titles=seen,
-                        )
+                    extra = research_goal(
+                        focus,
+                        limit=8,
+                        seen_titles=seen,
                     )
 
-                    for document in extra_documents:
+                    for document in extra:
+
                         seen.add(
                             document[
                                 "title"
                             ].lower()
                         )
 
-                    if extra_documents:
+                    if extra:
 
                         documents.extend(
-                            extra_documents
+                            extra
                         )
 
                         examples = (
-                            self._build_examples(
+                            self._build_dataset(
                                 goal,
                                 documents,
                             )
                         )
 
                         training_examples, holdout = (
-                            self._split_holdout(
+                            self._split(
                                 examples
                             )
                         )
 
+                        baseline = validation
+
                 else:
 
                     with self.lock:
+
                         self.status.phase = (
-                            "consolidate"
+                            "consolidating"
                         )
 
                         self.status.message = (
-                            "Consolidating learned state and replaying old material."
+                            "Saving learned state and continuing the curriculum."
                         )
 
-                # Give the frontend a chance to update.
-                time.sleep(0.02)
-
-            # ---------------------------------------------
-            # Final evaluation
-            # ---------------------------------------------
+                time.sleep(
+                    0.02
+                )
 
             final_validation = (
                 self._evaluate(
@@ -802,56 +849,81 @@ class Trainer:
 
             final_mastery = (
                 self._mastery(
-                    baseline_loss,
+                    baseline,
                     final_validation,
                 )
             )
 
             self.store.save()
 
-            session = {
-                "goal": goal,
-                "steps": self.store.step,
-                "sources": len(documents),
-                "baseline_loss": baseline_loss,
-                "final_validation_loss": final_validation,
-                "mastery": final_mastery,
-                "finished_at": time.time(),
-            }
+            learning["sessions"].append(
+                {
+                    "goal": goal,
+                    "steps": self.store.step,
+                    "sources": len(documents),
+                    "examples": len(examples),
+                    "baseline_loss": baseline,
+                    "final_validation_loss":
+                        final_validation,
+                    "mastery_proxy":
+                        final_mastery,
+                    "finished_at":
+                        time.time(),
+                }
+            )
 
-            self.memory.data[
-                "learning"
-            ][
-                "sessions"
-            ].append(session)
+            learning[
+                "seen_sources"
+            ] = list(seen)[-1000:]
 
             self.memory.save()
 
             with self.lock:
 
                 self.status.running = False
-                self.status.phase = "complete"
+                self.status.phase = (
+                    "complete"
+                )
+
                 self.status.elapsed = (
                     time.time()
                     - started
                 )
+
+                self.status.val_loss = (
+                    final_validation
+                )
+
                 self.status.mastery = (
                     final_mastery
+                )
+
+                self.status.steps = (
+                    self.store.step
                 )
 
                 self.status.message = (
                     "Training complete."
                 )
 
+                self.status.last_evaluation = (
+                    "The score is based on held-out "
+                    "loss improvement; it is not a claim of semantic mastery."
+                )
+
         except Exception as exc:
 
             with self.lock:
+
                 self.status.running = False
+
                 self.status.phase = "error"
+
                 self.status.elapsed = (
                     time.time()
                     - started
                 )
-                self.status.message = str(
-                    exc
+
+                self.status.message = (
+                    str(exc)
                 )
