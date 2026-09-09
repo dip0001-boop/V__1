@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import copy
 import random
 import re
 import threading
@@ -15,7 +16,6 @@ from research import research_goal
 
 @dataclass
 class TrainingStatus:
-
     running: bool = False
 
     goal: str = ""
@@ -33,10 +33,18 @@ class TrainingStatus:
     baseline_loss: float | None = None
     improvement: float | None = None
 
-    mastery_proxy: float | None = None
+    retention_baseline: float | None = None
+    retention_current: float | None = None
+    retention_delta: float | None = None
+
+    transfer_score: float | None = None
+
+    candidate_accepted: int = 0
+    candidate_rejected: int = 0
 
     sources: int = 0
     examples: int = 0
+    replay_examples: int = 0
 
     research_rounds: int = 0
 
@@ -52,49 +60,38 @@ class Trainer:
         store,
         memory,
     ):
-
         self.store = store
         self.memory = memory
 
-        self.evaluator = (
-            Evaluator(
-                store
-            )
+        self.evaluator = Evaluator(
+            store,
+            memory,
         )
 
-        self.status = (
-            TrainingStatus()
-        )
+        self.status = TrainingStatus()
 
         self.thread = None
 
-        self.stop_event = (
-            threading.Event()
-        )
+        self.stop_event = threading.Event()
 
-        self.lock = (
-            threading.RLock()
-        )
+        self.lock = threading.RLock()
 
         self.rng = random.Random()
 
-    def snapshot(self):
+    # =========================================================
+    # Public state
+    # =========================================================
 
+    def snapshot(self):
         with self.lock:
-            return asdict(
-                self.status
-            )
+            return asdict(self.status)
 
     def start(
         self,
         goal,
         minutes=20,
     ):
-
-        goal = (
-            str(goal)
-            .strip()
-        )
+        goal = str(goal).strip()
 
         if not goal:
             raise ValueError(
@@ -108,169 +105,175 @@ class Trainer:
                     "Training is already running."
                 )
 
+            requested = max(
+                1.0,
+                min(
+                    120.0,
+                    float(minutes),
+                ),
+            )
+
             self.stop_event.clear()
 
-            self.status = (
-                TrainingStatus(
-                    running=True,
-                    goal=goal,
-                    requested_minutes=
-                        max(
-                            1.0,
-                            min(
-                                120.0,
-                                float(minutes),
-                            ),
-                        ),
-                    phase="research",
-                    message=
-                        "Starting research and baseline evaluation.",
-                )
+            self.status = TrainingStatus(
+                running=True,
+                goal=goal,
+                phase="starting",
+                requested_minutes=requested,
+                message="Starting training pipeline.",
             )
 
-            requested = (
-                self.status.requested_minutes
-            )
-
-        self.thread = (
-            threading.Thread(
-                target=self._run,
-                args=(
-                    goal,
-                    requested,
-                ),
-                daemon=True,
-            )
+        self.thread = threading.Thread(
+            target=self._run,
+            args=(goal, requested),
+            daemon=True,
         )
 
         self.thread.start()
 
     def halt(self):
-
         self.stop_event.set()
 
     # =========================================================
-    # Dataset
+    # Utility
     # =========================================================
 
-    def _goal_examples(
+    def _update_status(self, **values):
+
+        with self.lock:
+
+            for key, value in values.items():
+
+                if hasattr(
+                    self.status,
+                    key,
+                ):
+                    setattr(
+                        self.status,
+                        key,
+                        value,
+                    )
+
+    def _remaining(self, deadline):
+        return time.time() < deadline
+
+    # =========================================================
+    # Dataset construction
+    # =========================================================
+
+    def _document_examples(
         self,
         goal,
         documents,
     ):
+        """
+        Convert researched observations into training experiences.
+
+        Important:
+        There are no hard-coded answer mappings here.
+        The model is trained on observed material, not
+        programmer-written responses.
+        """
 
         examples = []
 
         for document in documents:
 
-            title = document.get(
-                "title",
-                "",
-            )
+            title = str(
+                document.get(
+                    "title",
+                    "",
+                )
+            ).strip()
 
-            text = document.get(
-                "text",
-                "",
-            )
+            text = str(
+                document.get(
+                    "text",
+                    "",
+                )
+            ).strip()
 
-            if not text:
+            if len(text) < 200:
                 continue
 
-            # Explanatory continuation.
+            # Whole-document prediction experience.
             examples.append(
                 (
-                    f"Goal: {goal}\n"
+                    f"Learning objective: {goal}\n"
                     f"Source: {title}\n"
-                    f"Explanation: {text}"
+                    f"Material:\n{text}"
                 )
             )
 
+            # Sentence-group experiences.
             sentences = re.split(
                 r"(?<=[.!?])\s+",
                 text,
             )
 
-            for sentence in sentences:
-
-                sentence = (
-                    sentence.strip()
-                )
-
-                if (
-                    len(sentence)
-                    < 80
-                ):
-                    continue
-
-                examples.append(
-                    (
-                        f"Learning goal: {goal}\n"
-                        f"Concept: {sentence}\n"
-                        f"Explanation:"
-                    )
-                )
-
-                examples.append(
-                    (
-                        f"Topic: {title}\n"
-                        f"Important idea: {sentence}"
-                    )
-                )
-
-        # General conversation learning.
-        examples.extend(
-            [
-                (
-                    "User: hello\n"
-                    "Assistant: Hello! "
-                    "What would you like to explore?"
-                ),
-                (
-                    "User: hi\n"
-                    "Assistant: Hi! "
-                    "What are you working on?"
-                ),
-                (
-                    "User: explain that simply\n"
-                    "Assistant: Let's start with the main idea "
-                    "and then connect the important details."
-                ),
-                (
-                    "User: I don't understand\n"
-                    "Assistant: We can approach it from a simpler angle."
-                ),
+            usable = [
+                sentence.strip()
+                for sentence in sentences
+                if len(sentence.strip()) >= 60
             ]
-        )
 
+            self.rng.shuffle(
+                usable
+            )
+
+            for sentence in usable[:32]:
+
+                examples.append(
+                    (
+                        f"Learning objective: {goal}\n"
+                        f"Source concept: {title}\n"
+                        f"Observation:\n{sentence}"
+                    )
+                )
+
+        return examples
+
+    def _deduplicate(
+        self,
+        examples,
+    ):
         unique = []
         seen = set()
 
         for item in examples:
 
-            key = re.sub(
+            normalized = re.sub(
                 r"\s+",
                 " ",
                 item,
             ).strip().lower()
 
-            if key in seen:
+            if not normalized:
                 continue
 
-            seen.add(key)
+            if normalized in seen:
+                continue
+
+            seen.add(
+                normalized
+            )
+
             unique.append(
                 item
             )
 
-        self.rng.shuffle(
-            unique
-        )
-
         return unique
 
-    def _split(
+    def _split_dataset(
         self,
         examples,
     ):
+        """
+        Deterministic separation of training and validation
+        within the current candidate dataset.
+
+        Validation examples are never optimized directly.
+        """
 
         items = list(
             examples
@@ -280,53 +283,55 @@ class Trainer:
             items
         )
 
-        if len(items) < 20:
+        if len(items) < 8:
 
-            cut = max(
-                2,
-                len(items) // 4,
+            split = max(
+                1,
+                len(items) // 3,
             )
 
         else:
 
-            cut = max(
-                20,
+            split = max(
+                2,
                 min(
-                    160,
+                    128,
                     len(items) // 5,
                 ),
             )
 
+        validation = items[:split]
+        training = items[split:]
+
+        if not training:
+
+            training = validation[:]
+
         return (
-            items[cut:],
-            items[:cut],
+            training,
+            validation,
         )
 
     # =========================================================
-    # Batching
+    # Token batches
     # =========================================================
 
     def _batch(
         self,
         examples,
-        batch_size=8,
+        batch_size=4,
     ):
-
-        sequence_length = (
-            min(
-                512,
-                self.store.model.cfg.context,
-            )
+        sequence_length = min(
+            512,
+            self.store.model.cfg.context,
         )
 
         usable = []
 
         for example in examples:
 
-            ids = (
-                self.store.tokenizer.encode(
-                    example
-                )
+            ids = self.store.tokenizer.encode(
+                example
             )
 
             if len(ids) >= 8:
@@ -350,20 +355,19 @@ class Trainer:
                 usable
             )
 
-            if len(ids) < (
+            required = (
                 sequence_length + 1
-            ):
+            )
+
+            if len(ids) < required:
 
                 repeats = (
-                    (
-                        sequence_length
-                        + 1
-                    )
-                    // len(ids)
-                    + 1
-                )
+                    required // len(ids)
+                ) + 1
 
-                ids = ids * repeats
+                ids = (
+                    ids * repeats
+                )
 
             maximum = (
                 len(ids)
@@ -376,21 +380,18 @@ class Trainer:
                 maximum,
             )
 
-            xs.append(
-                ids[
-                    start:
-                    start
-                    + sequence_length
-                ]
-            )
+            x = ids[
+                start:
+                start + sequence_length
+            ]
 
-            ys.append(
-                ids[
-                    start + 1:
-                    start + 1
-                    + sequence_length
-                ]
-            )
+            y = ids[
+                start + 1:
+                start + 1 + sequence_length
+            ]
+
+            xs.append(x)
+            ys.append(y)
 
         return (
             torch.tensor(
@@ -404,14 +405,13 @@ class Trainer:
         )
 
     # =========================================================
-    # Real optimization
+    # Real neural optimization
     # =========================================================
 
-    def _step(
+    def _optimizer_step(
         self,
         examples,
     ):
-
         self.store.model.train()
 
         x, y = self._batch(
@@ -420,8 +420,8 @@ class Trainer:
 
         with self.store.lock:
 
-            logits = (
-                self.store.model(x)
+            logits = self.store.model(
+                x
             )
 
             loss = F.cross_entropy(
@@ -452,69 +452,135 @@ class Trainer:
         )
 
     # =========================================================
-    # Focus selection
+    # Candidate checkpointing
     # =========================================================
 
-    def _focus(
-        self,
-        goal,
-        documents,
-    ):
+    def _snapshot_state(self):
 
-        words = []
+        with self.store.lock:
 
-        for document in documents:
+            model_state = {
+                name: value.detach().clone()
+                for name, value
+                in self.store.model.state_dict().items()
+            }
 
-            text = (
-                document.get(
-                    "text",
-                    "",
-                )
+            optimizer_state = copy.deepcopy(
+                self.store.optimizer.state_dict()
             )
 
-            words.extend(
-                re.findall(
-                    r"[A-Za-z]{5,}",
-                    text,
-                )
-            )
-
-        counts = {}
-
-        for word in words:
-
-            key = (
-                word.lower()
-            )
-
-            counts[key] = (
-                counts.get(
-                    key,
-                    0,
-                )
-                + 1
-            )
-
-        uncommon = sorted(
-            counts,
-            key=counts.get,
-        )
-
-        if uncommon:
-
-            return (
-                f"{goal} "
-                + " ".join(
-                    uncommon[:10]
-                )
-            )
+            step = self.store.step
 
         return (
-            f"{goal} fundamentals examples"
+            model_state,
+            optimizer_state,
+            step,
         )
 
+    def _restore_state(
+        self,
+        snapshot,
+    ):
+        model_state, optimizer_state, step = (
+            snapshot
+        )
+
+        with self.store.lock:
+
+            self.store.model.load_state_dict(
+                model_state
+            )
+
+            self.store.optimizer.load_state_dict(
+                optimizer_state
+            )
+
+            self.store.step = step
+
     # =========================================================
-    # Session
+    # Replay
+    # =========================================================
+
+    def _build_replay(
+        self,
+        examples,
+    ):
+        replay = self.memory.replay_examples(
+            maximum=256
+        )
+
+        if not replay:
+            return []
+
+        combined = list(
+            examples
+        )
+
+        combined.extend(
+            replay
+        )
+
+        return self._deduplicate(
+            combined
+        )
+
+    def _record_experience(
+        self,
+        examples,
+        priority=1.0,
+    ):
+
+        for example in examples[:16]:
+
+            self.memory.add_replay(
+                example,
+                priority=priority,
+            )
+
+    # =========================================================
+    # Focus / curriculum
+    # =========================================================
+
+    def _focus_from_history(
+        self,
+        goal,
+    ):
+        history = self.memory.learning_history()
+
+        failures = history.get(
+            "weaknesses",
+            [],
+        )
+
+        if failures:
+
+            strongest = sorted(
+                failures,
+                key=lambda item: float(
+                    item.get(
+                        "severity",
+                        0.0,
+                    )
+                ),
+                reverse=True,
+            )
+
+            if strongest:
+
+                target = strongest[0].get(
+                    "target",
+                    "",
+                )
+
+                if target:
+                    return (
+                        f"{goal} {target}"
+                    )
+
+        return goal
+
+    # =========================================================
+    # Main training session
     # =========================================================
 
     def _run(
@@ -524,6 +590,11 @@ class Trainer:
     ):
 
         started = time.time()
+
+        deadline = (
+            started
+            + minutes * 60.0
+        )
 
         try:
 
@@ -549,326 +620,476 @@ class Trainer:
                 [],
             )
 
+            learning.setdefault(
+                "weaknesses",
+                [],
+            )
+
             seen = set(
                 learning[
                     "seen_sources"
                 ]
             )
 
-            # -------------------------------------------------
+            # =================================================
             # Research
-            # -------------------------------------------------
+            # =================================================
 
-            with self.lock:
+            self._update_status(
+                phase="research",
+                message=(
+                    "Selecting a high-value learning target."
+                ),
+            )
 
-                self.status.phase = (
-                    "research"
-                )
+            focus = self._focus_from_history(
+                goal
+            )
 
-                self.status.message = (
-                    "Finding relevant new material."
-                )
+            self._update_status(
+                focus=focus,
+            )
 
-            documents = (
-                research_goal(
-                    goal,
-                    limit=12,
-                    seen_titles=seen,
-                )
+            documents = research_goal(
+                focus,
+                limit=12,
+                seen_titles=seen,
             )
 
             for document in documents:
 
-                seen.add(
-                    document[
-                        "title"
-                    ].lower()
-                )
+                title = str(
+                    document.get(
+                        "title",
+                        "",
+                    )
+                ).strip().lower()
+
+                if title:
+                    seen.add(
+                        title
+                    )
 
             learning[
                 "seen_sources"
             ] = list(
                 seen
-            )[-2000:]
+            )[-4000:]
 
             self.memory.save()
 
-            # -------------------------------------------------
-            # Dataset
-            # -------------------------------------------------
+            # =================================================
+            # Construct experiences
+            # =================================================
 
-            examples = (
-                self._goal_examples(
+            self._update_status(
+                phase="experience",
+                message=(
+                    "Constructing learning experiences from observations."
+                ),
+            )
+
+            fresh_examples = (
+                self._document_examples(
                     goal,
                     documents,
                 )
             )
 
-            replay = (
-                self.memory.replay_examples(
-                    maximum=256
-                )
+            fresh_examples = self._deduplicate(
+                fresh_examples
             )
 
-            # Replay old learned material.
+            replay = self.memory.replay_examples(
+                maximum=256
+            )
+
+            replay_count = len(
+                replay
+            )
+
+            examples = list(
+                fresh_examples
+            )
+
             examples.extend(
                 replay
             )
 
-            training, holdout = (
-                self._split(
+            examples = self._deduplicate(
+                examples
+            )
+
+            if len(examples) < 4:
+
+                raise RuntimeError(
+                    "Not enough valid learning experience was produced."
+                )
+
+            training_examples, validation_examples = (
+                self._split_dataset(
                     examples
                 )
             )
 
-            with self.lock:
+            self._update_status(
+                sources=len(documents),
+                examples=len(examples),
+                replay_examples=replay_count,
+            )
 
-                self.status.sources = (
-                    len(documents)
-                )
+            # =================================================
+            # Independent baseline
+            # =================================================
 
-                self.status.examples = (
-                    len(examples)
-                )
+            self._update_status(
+                phase="baseline",
+                message=(
+                    "Measuring the current model before updating it."
+                ),
+            )
 
-            # -------------------------------------------------
-            # Baseline
-            # -------------------------------------------------
-
-            baseline = (
+            validation_baseline = (
                 self.evaluator.loss(
-                    holdout
+                    validation_examples
                 )
             )
 
-            with self.lock:
-
-                self.status.baseline_loss = (
-                    baseline
-                )
-
-                self.status.phase = (
-                    "learning"
-                )
-
-                self.status.message = (
-                    "Performing real gradient updates."
-                )
-
-            # -------------------------------------------------
-            # Main learning loop
-            # -------------------------------------------------
-
-            deadline = (
-                started
-                + minutes * 60.0
+            retention_baseline = (
+                self.evaluator.retention_score()
             )
+
+            self._update_status(
+                baseline_loss=validation_baseline,
+                retention_baseline=retention_baseline,
+            )
+
+            # =================================================
+            # Learning cycles
+            # =================================================
 
             cycle = 0
 
             while (
-                time.time()
-                < deadline
+                self._remaining(deadline)
                 and not self.stop_event.is_set()
             ):
 
                 cycle += 1
 
+                # ---------------------------------------------
+                # Save candidate state
+                # ---------------------------------------------
+
+                candidate_before = (
+                    self._snapshot_state()
+                )
+
+                self._update_status(
+                    phase="learning",
+                    message=(
+                        "Updating neural parameters from observed experience."
+                    ),
+                )
+
                 losses = []
 
-                for _ in range(
-                    24
-                ):
+                for _ in range(16):
 
-                    if (
-                        time.time()
-                        >= deadline
-                        or self.stop_event.is_set()
+                    if not self._remaining(
+                        deadline
                     ):
                         break
 
+                    if self.stop_event.is_set():
+                        break
+
                     losses.append(
-                        self._step(
-                            training
+                        self._optimizer_step(
+                            training_examples
                         )
                     )
 
-                validation = (
+                if not losses:
+                    break
+
+                candidate_loss = (
                     self.evaluator.loss(
-                        holdout
+                        validation_examples
                     )
                 )
 
-                improvement = (
+                candidate_retention = (
+                    self.evaluator.retention_score()
+                )
+
+                transfer_score = (
+                    self.evaluator.transfer_score(
+                        goal,
+                        documents,
+                        validation_examples,
+                    )
+                )
+
+                validation_improvement = (
                     self.evaluator.improvement(
-                        baseline,
-                        validation,
+                        validation_baseline,
+                        candidate_loss,
                     )
                 )
 
-                score = (
-                    self.evaluator.score(
-                        baseline,
-                        validation,
-                    )
+                retention_delta = (
+                    candidate_retention
+                    - retention_baseline
                 )
 
-                train_loss = (
-                    sum(losses)
-                    / len(losses)
-                    if losses
-                    else None
+                # ---------------------------------------------
+                # Candidate acceptance
+                #
+                # A candidate must improve its current
+                # objective without causing unacceptable
+                # retention degradation.
+                # ---------------------------------------------
+
+                accepted = (
+                    candidate_loss is not None
+                    and validation_baseline is not None
+                    and candidate_loss < validation_baseline
+                    and retention_delta >= -0.02
                 )
 
-                with self.lock:
+                if accepted:
 
-                    self.status.step = (
-                        self.store.step
+                    self.store.best_validation = (
+                        candidate_loss
                     )
 
-                    self.status.cycle = (
-                        cycle
+                    self.store.save()
+
+                    self._record_experience(
+                        training_examples,
+                        priority=max(
+                            1.0,
+                            1.0 + max(
+                                0.0,
+                                validation_improvement,
+                            ),
+                        ),
                     )
 
-                    self.status.train_loss = (
-                        train_loss
+                    validation_baseline = (
+                        candidate_loss
                     )
 
-                    self.status.validation_loss = (
-                        validation
+                    retention_baseline = (
+                        candidate_retention
                     )
 
-                    self.status.improvement = (
-                        improvement
+                    self.memory.record_outcome(
+                        goal=goal,
+                        accepted=True,
+                        validation_before=(
+                            validation_baseline
+                            - validation_improvement
+                            if validation_improvement
+                            is not None
+                            else None
+                        ),
+                        validation_after=(
+                            candidate_loss
+                        ),
+                        retention_before=(
+                            retention_baseline
+                            - retention_delta
+                            if retention_delta
+                            is not None
+                            else None
+                        ),
+                        retention_after=(
+                            candidate_retention
+                        ),
+                        transfer=transfer_score,
                     )
 
-                    self.status.mastery_proxy = (
-                        score
+                    accepted_count = (
+                        self.status.candidate_accepted
+                        + 1
                     )
 
-                    self.status.elapsed = (
-                        time.time()
-                        - started
+                    self._update_status(
+                        candidate_accepted=(
+                            accepted_count
+                        ),
                     )
 
-                    self.status.message = (
-                        f"Cycle {cycle}: "
-                        f"{len(losses)} optimizer updates."
+                else:
+
+                    # Critical:
+                    # restore both neural parameters AND
+                    # optimizer state.
+                    self._restore_state(
+                        candidate_before
                     )
 
-                # Checkpoint after every cycle.
-                self.store.save()
+                    self.memory.record_outcome(
+                        goal=goal,
+                        accepted=False,
+                        validation_before=(
+                            validation_baseline
+                        ),
+                        validation_after=(
+                            candidate_loss
+                        ),
+                        retention_before=(
+                            retention_baseline
+                        ),
+                        retention_after=(
+                            candidate_retention
+                        ),
+                        transfer=transfer_score,
+                    )
 
-                # -------------------------------------------------
-                # Remediation
-                # -------------------------------------------------
+                    rejected_count = (
+                        self.status.candidate_rejected
+                        + 1
+                    )
+
+                    self._update_status(
+                        candidate_rejected=(
+                            rejected_count
+                        ),
+                    )
+
+                    # Record observed weakness for curriculum
+                    # scheduling. This is infrastructure,
+                    # not domain intelligence.
+                    severity = 0.0
+
+                    if validation_improvement is not None:
+                        severity += max(
+                            0.0,
+                            -validation_improvement,
+                        )
+
+                    if retention_delta < 0:
+                        severity += abs(
+                            retention_delta
+                        )
+
+                    self.memory.record_weakness(
+                        target=focus,
+                        severity=severity,
+                    )
+
+                mean_train_loss = (
+                    sum(losses) / len(losses)
+                )
+
+                elapsed = (
+                    time.time()
+                    - started
+                )
+
+                self._update_status(
+                    cycle=cycle,
+                    step=self.store.step,
+                    train_loss=mean_train_loss,
+                    validation_loss=candidate_loss,
+                    improvement=validation_improvement,
+                    retention_current=candidate_retention,
+                    retention_delta=retention_delta,
+                    transfer_score=transfer_score,
+                    elapsed=elapsed,
+                )
+
+                # =================================================
+                # Curriculum remediation
+                # =================================================
 
                 if (
-                    score < 0.80
-                    and cycle % 2 == 0
-                    and time.time() < deadline
+                    cycle % 2 == 0
+                    and self._remaining(deadline)
+                    and not self.stop_event.is_set()
                 ):
 
-                    focus = (
-                        self._focus(
-                            goal,
-                            documents,
-                        )
+                    self._update_status(
+                        phase="curriculum",
+                        message=(
+                            "Assessing whether new evidence is more valuable."
+                        ),
                     )
 
-                    with self.lock:
+                    new_focus = self._focus_from_history(
+                        goal
+                    )
 
-                        self.status.phase = (
-                            "remediation"
+                    if new_focus != focus:
+
+                        focus = new_focus
+
+                        self._update_status(
+                            focus=focus,
                         )
 
-                        self.status.focus = (
-                            focus
-                        )
-
-                        self.status.message = (
-                            "Validation improvement is weak; "
-                            "searching for additional material."
-                        )
-
-                    extra = (
-                        research_goal(
-                            focus,
-                            limit=8,
-                            seen_titles=seen,
-                        )
+                    extra = research_goal(
+                        focus,
+                        limit=8,
+                        seen_titles=seen,
                     )
 
                     if extra:
 
                         for document in extra:
 
-                            seen.add(
-                                document[
-                                    "title"
-                                ].lower()
-                            )
+                            title = str(
+                                document.get(
+                                    "title",
+                                    "",
+                                )
+                            ).strip().lower()
+
+                            if title:
+                                seen.add(
+                                    title
+                                )
 
                         documents.extend(
                             extra
                         )
 
-                        examples = (
-                            self._goal_examples(
+                        new_examples = (
+                            self._document_examples(
                                 goal,
-                                documents,
+                                extra,
                             )
                         )
 
-                        replay = (
-                            self.memory.replay_examples(
-                                maximum=256
+                        new_examples = (
+                            self._deduplicate(
+                                new_examples
                             )
                         )
 
-                        examples.extend(
-                            replay
+                        training_examples.extend(
+                            new_examples
                         )
 
-                        training, holdout = (
-                            self._split(
-                                examples
+                        training_examples = (
+                            self._deduplicate(
+                                training_examples
                             )
                         )
 
-                        # Re-establish baseline on the new
-                        # unseen holdout.
-                        baseline = (
-                            self.evaluator.loss(
-                                holdout
-                            )
+                        self._update_status(
+                            research_rounds=(
+                                self.status.research_rounds
+                                + 1
+                            ),
+                            sources=len(documents),
+                            examples=len(
+                                training_examples
+                            ),
                         )
-
-                        with self.lock:
-
-                            self.status.research_rounds += 1
-
-                else:
-
-                    with self.lock:
-
-                        self.status.phase = (
-                            "consolidating"
-                        )
-
-                        self.status.message = (
-                            "Saving learned state and replay."
-                        )
-
-                # Store a sample of useful training experience.
-                for example in (
-                    training[:8]
-                ):
-
-                    self.memory.add_replay(
-                        example,
-                        priority=1.0,
-                    )
 
                 self.memory.save()
 
@@ -876,107 +1097,115 @@ class Trainer:
                     0.01
                 )
 
-            # -------------------------------------------------
+            # =================================================
             # Final evaluation
-            # -------------------------------------------------
+            # =================================================
 
-            final_loss = (
+            self._update_status(
+                phase="evaluation",
+                message=(
+                    "Running final held-out, retention, and transfer evaluation."
+                ),
+            )
+
+            final_validation = (
                 self.evaluator.loss(
-                    holdout
+                    validation_examples
                 )
             )
 
-            final_score = (
-                self.evaluator.score(
-                    baseline,
-                    final_loss,
+            final_retention = (
+                self.evaluator.retention_score()
+            )
+
+            final_transfer = (
+                self.evaluator.transfer_score(
+                    goal,
+                    documents,
+                    validation_examples,
                 )
             )
 
-            self.store.save()
+            accepted = (
+                final_validation is not None
+                and validation_baseline is not None
+                and final_validation
+                <= validation_baseline
+                and final_retention
+                >= retention_baseline - 0.02
+            )
+
+            self._update_status(
+                running=False,
+                phase="complete",
+                validation_loss=final_validation,
+                retention_current=final_retention,
+                retention_delta=(
+                    final_retention
+                    - retention_baseline
+                ),
+                transfer_score=final_transfer,
+                elapsed=(
+                    time.time()
+                    - started
+                ),
+                message=(
+                    "Training complete."
+                    if accepted
+                    else
+                    "Training complete; latest candidate did not beat the acceptance baseline."
+                ),
+            )
 
             learning[
                 "sessions"
             ].append(
                 {
-                    "goal":
-                        goal,
-
-                    "steps":
-                        self.store.step,
-
-                    "sources":
-                        len(documents),
-
-                    "examples":
-                        len(examples),
-
-                    "baseline_loss":
-                        baseline,
-
-                    "final_validation_loss":
-                        final_loss,
-
-                    "mastery_proxy":
-                        final_score,
-
-                    "finished_at":
-                        time.time(),
+                    "goal": goal,
+                    "started": started,
+                    "elapsed": time.time() - started,
+                    "steps": self.store.step,
+                    "validation_loss": final_validation,
+                    "retention": final_retention,
+                    "transfer": final_transfer,
+                    "accepted": accepted,
+                    "candidates_accepted": (
+                        self.status.candidate_accepted
+                    ),
+                    "candidates_rejected": (
+                        self.status.candidate_rejected
+                    ),
                 }
             )
+
+            learning[
+                "sessions"
+            ] = learning[
+                "sessions"
+            ][-500:]
 
             learning[
                 "seen_sources"
             ] = list(
                 seen
-            )[-2000:]
+            )[-4000:]
 
             self.memory.save()
 
-            with self.lock:
-
-                self.status.running = False
-
-                self.status.phase = (
-                    "complete"
-                )
-
-                self.status.step = (
-                    self.store.step
-                )
-
-                self.status.elapsed = (
-                    time.time()
-                    - started
-                )
-
-                self.status.validation_loss = (
-                    final_loss
-                )
-
-                self.status.mastery_proxy = (
-                    final_score
-                )
-
-                self.status.message = (
-                    "Training complete."
-                )
-
         except Exception as exc:
 
-            with self.lock:
-
-                self.status.running = False
-
-                self.status.phase = (
-                    "error"
-                )
-
-                self.status.elapsed = (
+            self._update_status(
+                running=False,
+                phase="error",
+                elapsed=(
                     time.time()
                     - started
-                )
+                ),
+                message=str(exc),
+            )
 
-                self.status.message = (
-                    str(exc)
-                )
+            try:
+                self.memory.save()
+                self.store.save()
+            except Exception:
+                pass
