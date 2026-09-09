@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -28,27 +29,44 @@ app.mount(
     name="static",
 )
 
-
 store = ModelStore(ROOT / "verdant_state.pt")
 memory = MemoryStore(ROOT / "verdant_memory.json")
 trainer = Trainer(store, memory)
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=12000)
+    message: str = Field(
+        min_length=1,
+        max_length=12000,
+    )
     chat_id: str | None = None
     effort: str = "medium"
 
 
 class TrainRequest(BaseModel):
-    goal: str = Field(min_length=2, max_length=300)
-    minutes: float = Field(default=20, ge=1, le=120)
+    goal: str = Field(
+        min_length=2,
+        max_length=300,
+    )
+    minutes: float = Field(
+        default=20,
+        ge=1,
+        le=120,
+    )
 
 
 @app.get("/", include_in_schema=False)
 @app.head("/", include_in_schema=False)
 def index():
-    return FileResponse(ROOT / "index.html")
+    path = ROOT / "index.html"
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="index.html not found",
+        )
+
+    return FileResponse(path)
 
 
 @app.get("/api/health")
@@ -57,6 +75,7 @@ def health():
         "ok": True,
         "model_step": store.step,
         "parameters": store.parameter_count(),
+        "training": trainer.snapshot(),
     }
 
 
@@ -69,18 +88,34 @@ def status():
     }
 
 
-def effort_config(effort: str) -> tuple[int, float]:
-    return {
-        "lite": (96, 0.95),
-        "medium": (160, 0.85),
-        "max": (256, 0.72),
-    }.get(
+def effort_config(effort: str):
+    configs = {
+        "lite": {
+            "max_new": 96,
+            "temperature": 0.95,
+        },
+        "medium": {
+            "max_new": 160,
+            "temperature": 0.85,
+        },
+        "max": {
+            "max_new": 256,
+            "temperature": 0.72,
+        },
+    }
+
+    return configs.get(
         (effort or "medium").lower(),
-        (160, 0.85),
+        configs["medium"],
     )
 
 
-def sample(prompt: str, max_new: int, temperature: float) -> str:
+def sample(
+    prompt: str,
+    max_new: int,
+    temperature: float,
+) -> str:
+
     tokenizer = store.tokenizer
 
     ids = tokenizer.encode(
@@ -96,31 +131,41 @@ def sample(prompt: str, max_new: int, temperature: float) -> str:
         dtype=torch.long,
     )
 
-    generated: list[int] = []
+    generated = []
     hidden = None
 
     store.model.eval()
 
     with torch.no_grad():
-        logits, hidden = store.model(x, hidden)
+
+        _, hidden = store.model(
+            x,
+            hidden,
+        )
+
         last = x[:, -1:]
 
         for _ in range(max_new):
-            logits, hidden = store.model(last, hidden)
 
-            next_logits = (
-                logits[:, -1, :]
-                / max(0.25, temperature)
+            logits, hidden = store.model(
+                last,
+                hidden,
             )
 
-            probs = torch.softmax(
-                next_logits,
+            logits = logits[:, -1, :]
+
+            logits = logits / max(
+                0.25,
+                temperature,
+            )
+
+            probabilities = torch.softmax(
+                logits,
                 dim=-1,
             )
 
-            # Nucleus sampling.
             values, indices = torch.sort(
-                probs,
+                probabilities,
                 descending=True,
             )
 
@@ -134,10 +179,12 @@ def sample(prompt: str, max_new: int, temperature: float) -> str:
 
             values = values * keep
 
-            values = values / values.sum(
+            denominator = values.sum(
                 dim=-1,
                 keepdim=True,
             )
+
+            values = values / denominator
 
             picked = torch.multinomial(
                 values,
@@ -149,8 +196,12 @@ def sample(prompt: str, max_new: int, temperature: float) -> str:
                 picked,
             )
 
+            token_id = int(
+                next_token.item()
+            )
+
             generated.append(
-                int(next_token.item())
+                token_id
             )
 
             last = next_token
@@ -162,11 +213,31 @@ def sample(prompt: str, max_new: int, temperature: float) -> str:
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
-    chat_id = request.chat_id or str(uuid.uuid4())
 
-    conversation = memory.chat(chat_id)
+    chat_id = (
+        request.chat_id
+        or str(uuid.uuid4())
+    )
 
-    recent = conversation["messages"][-10:]
+    conversation = memory.chat(
+        chat_id
+    )
+
+    recent = conversation[
+        "messages"
+    ][-10:]
+
+    context_parts = []
+
+    for message in recent:
+        context_parts.append(
+            f"{message['role'].title()}: "
+            f"{message['content']}"
+        )
+
+    context = "\n".join(
+        context_parts
+    )
 
     memory.add_message(
         chat_id,
@@ -174,12 +245,7 @@ def chat(request: ChatRequest):
         request.message,
     )
 
-    context = "\n".join(
-        f"{m['role'].title()}: {m['content']}"
-        for m in recent
-    )
-
-    max_new, temperature = effort_config(
+    settings = effort_config(
         request.effort
     )
 
@@ -193,9 +259,10 @@ def chat(request: ChatRequest):
     try:
         answer = sample(
             prompt,
-            max_new,
-            temperature,
+            settings["max_new"],
+            settings["temperature"],
         )
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -208,45 +275,49 @@ def chat(request: ChatRequest):
         answer,
     )
 
-    updated = memory.chat(chat_id)
+    updated = memory.chat(
+        chat_id
+    )
 
-    summary = summarize(
+    chat_summary = summarize(
         updated["messages"]
     )
 
     memory.set_summary(
         chat_id,
-        summary,
+        chat_summary,
     )
 
     return {
         "chat_id": chat_id,
         "response": answer,
-        "summary": summary,
+        "summary": chat_summary,
         "effort": request.effort,
         "training_step": store.step,
     }
 
 
 @app.post("/api/train/start")
-def start_training(request: TrainRequest):
+def start_training(
+    request: TrainRequest,
+):
     try:
         trainer.start(
             request.goal,
             request.minutes,
         )
 
-        return {
-            "ok": True,
-            "goal": request.goal,
-            "minutes": request.minutes,
-        }
-
     except Exception as exc:
         raise HTTPException(
             status_code=409,
             detail=str(exc),
         ) from exc
+
+    return {
+        "ok": True,
+        "goal": request.goal,
+        "minutes": request.minutes,
+    }
 
 
 @app.post("/api/train/stop")
