@@ -10,148 +10,391 @@ from torch import nn
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 256
+    vocab_size: int = 8192
     embed_dim: int = 512
     hidden_dim: int = 768
-    layers: int = 3
-    context: int = 512
+    heads: int = 8
+    layers: int = 6
+    context: int = 768
     dropout: float = 0.10
 
 
-class VerdantCore(nn.Module):
+class CausalSelfAttention(nn.Module):
 
     def __init__(
         self,
-        cfg: ModelConfig | None = None,
+        dim: int,
+        heads: int,
+        dropout: float,
     ):
         super().__init__()
 
-        self.cfg = cfg or ModelConfig()
+        if dim % heads != 0:
+            raise ValueError(
+                "embed_dim must be divisible by heads"
+            )
 
-        self.embedding = nn.Embedding(
-            self.cfg.vocab_size,
-            self.cfg.embed_dim,
+        self.heads = heads
+        self.head_dim = dim // heads
+
+        self.qkv = nn.Linear(
+            dim,
+            dim * 3,
         )
 
-        self.input_projection = nn.Linear(
-            self.cfg.embed_dim,
-            self.cfg.embed_dim,
+        self.out = nn.Linear(
+            dim,
+            dim,
         )
 
-        self.rnn = nn.GRU(
-            self.cfg.embed_dim,
-            self.cfg.hidden_dim,
-            num_layers=self.cfg.layers,
-            batch_first=True,
-            dropout=(
-                self.cfg.dropout
-                if self.cfg.layers > 1
-                else 0.0
-            ),
-        )
-
-        self.norm = nn.LayerNorm(
-            self.cfg.hidden_dim
-        )
-
-        self.output_projection = nn.Linear(
-            self.cfg.hidden_dim,
-            self.cfg.vocab_size,
+        self.dropout = nn.Dropout(
+            dropout
         )
 
     def forward(
         self,
         x,
-        hidden=None,
     ):
 
-        embedded = self.embedding(x)
+        batch, length, dim = x.shape
 
-        embedded = torch.tanh(
-            self.input_projection(
-                embedded
+        qkv = self.qkv(x)
+
+        q, k, v = qkv.chunk(
+            3,
+            dim=-1,
+        )
+
+        q = q.view(
+            batch,
+            length,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        k = k.view(
+            batch,
+            length,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        v = v.view(
+            batch,
+            length,
+            self.heads,
+            self.head_dim,
+        ).transpose(1, 2)
+
+        scale = self.head_dim ** -0.5
+
+        scores = (
+            q @ k.transpose(
+                -2,
+                -1,
             )
+        ) * scale
+
+        mask = torch.triu(
+            torch.ones(
+                length,
+                length,
+                device=x.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
         )
 
-        states, hidden = self.rnn(
-            embedded,
-            hidden,
+        scores = scores.masked_fill(
+            mask,
+            float("-inf"),
         )
 
-        states = self.norm(
-            states
+        weights = torch.softmax(
+            scores,
+            dim=-1,
         )
 
-        logits = self.output_projection(
-            states
+        weights = self.dropout(
+            weights
         )
 
-        return logits, hidden
+        output = weights @ v
+
+        output = output.transpose(
+            1,
+            2,
+        ).contiguous().view(
+            batch,
+            length,
+            dim,
+        )
+
+        return self.out(
+            output
+        )
 
 
-class ByteTokenizer:
+class FeedForward(nn.Module):
 
-    vocab_size = 256
-
-    def encode(
+    def __init__(
         self,
-        text: str,
-        max_len: int | None = None,
+        dim: int,
+        dropout: float,
     ):
+        super().__init__()
 
-        data = list(
-            text.encode(
-                "utf-8",
-                errors="replace",
+        inner = dim * 4
+
+        self.net = nn.Sequential(
+            nn.Linear(
+                dim,
+                inner,
+            ),
+            nn.GELU(),
+            nn.Dropout(
+                dropout
+            ),
+            nn.Linear(
+                inner,
+                dim,
+            ),
+            nn.Dropout(
+                dropout
+            ),
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+        return self.net(x)
+
+
+class TransformerBlock(nn.Module):
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+    ):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(
+            cfg.embed_dim
+        )
+
+        self.attention = (
+            CausalSelfAttention(
+                cfg.embed_dim,
+                cfg.heads,
+                cfg.dropout,
             )
         )
 
-        if max_len is not None:
-            data = data[-max_len:]
-
-        return data
-
-    def decode(self, ids):
-
-        return bytes(
-            int(i) % 256
-            for i in ids
-        ).decode(
-            "utf-8",
-            errors="ignore",
+        self.norm2 = nn.LayerNorm(
+            cfg.embed_dim
         )
+
+        self.feed_forward = (
+            FeedForward(
+                cfg.embed_dim,
+                cfg.dropout,
+            )
+        )
+
+    def forward(
+        self,
+        x,
+    ):
+
+        x = x + self.attention(
+            self.norm1(x)
+        )
+
+        x = x + self.feed_forward(
+            self.norm2(x)
+        )
+
+        return x
+
+
+class VerdantCore(nn.Module):
+    """
+    From-scratch causal learned core.
+
+    No answer database.
+    No topic-specific response rules.
+    """
+
+    def __init__(
+        self,
+        cfg: ModelConfig,
+    ):
+        super().__init__()
+
+        self.cfg = cfg
+
+        self.token_embedding = (
+            nn.Embedding(
+                cfg.vocab_size,
+                cfg.embed_dim,
+            )
+        )
+
+        self.position_embedding = (
+            nn.Embedding(
+                cfg.context,
+                cfg.embed_dim,
+            )
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(cfg)
+                for _ in range(
+                    cfg.layers
+                )
+            ]
+        )
+
+        self.norm = nn.LayerNorm(
+            cfg.embed_dim
+        )
+
+        self.readout = nn.Linear(
+            cfg.embed_dim,
+            cfg.vocab_size,
+            bias=False,
+        )
+
+        # Weight tying improves parameter efficiency.
+        self.readout.weight = (
+            self.token_embedding.weight
+        )
+
+    def forward(
+        self,
+        tokens,
+    ):
+
+        batch, length = tokens.shape
+
+        if length > self.cfg.context:
+            tokens = tokens[
+                :,
+                -self.cfg.context:
+            ]
+
+            length = tokens.shape[1]
+
+        positions = torch.arange(
+            length,
+            device=tokens.device,
+        )
+
+        x = (
+            self.token_embedding(tokens)
+            + self.position_embedding(
+                positions
+            )[None, :, :]
+        )
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+
+        return self.readout(x)
+
+    @torch.no_grad()
+    def latent(
+        self,
+        tokens,
+    ):
+        batch, length = tokens.shape
+
+        if length > self.cfg.context:
+            tokens = tokens[
+                :,
+                -self.cfg.context:
+            ]
+            length = tokens.shape[1]
+
+        positions = torch.arange(
+            length,
+            device=tokens.device,
+        )
+
+        x = (
+            self.token_embedding(tokens)
+            + self.position_embedding(
+                positions
+            )[None, :, :]
+        )
+
+        for block in self.blocks:
+            x = block(x)
+
+        return self.norm(x[:, -1])
 
 
 class ModelStore:
 
     def __init__(
         self,
-        path="verdant_state.pt",
+        path: str | Path,
+        tokenizer,
     ):
-
         self.path = Path(path)
-
         self.lock = threading.RLock()
 
-        self.tokenizer = ByteTokenizer()
+        self.tokenizer = tokenizer
 
-        self.model = VerdantCore()
+        self.model = None
+        self.optimizer = None
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=8e-4,
+        self.step = 0
+        self.best_validation = None
+
+        self._load()
+
+    def _new_model(
+        self,
+        cfg: ModelConfig | None = None,
+    ):
+        configuration = (
+            cfg
+            or ModelConfig(
+                vocab_size=
+                    self.tokenizer.vocab_size
+            )
+        )
+
+        model = VerdantCore(
+            configuration
+        )
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=3e-4,
+            betas=(0.9, 0.95),
             weight_decay=0.01,
         )
 
-        self.step = 0
+        return model, optimizer
 
-        self.best_val = None
-
-        self._load()
+    def initialize(
+        self,
+    ):
+        with self.lock:
+            self.model, self.optimizer = (
+                self._new_model()
+            )
 
     def _load(self):
 
         if not self.path.exists():
+            self.initialize()
             return
 
         payload = torch.load(
@@ -159,22 +402,30 @@ class ModelStore:
             map_location="cpu",
         )
 
-        config = payload.get(
+        config_data = payload.get(
             "config"
         )
 
-        if config:
-            self.model = VerdantCore(
-                ModelConfig(
-                    **config
-                )
+        if config_data:
+            cfg = ModelConfig(
+                **config_data
+            )
+        else:
+            cfg = ModelConfig(
+                vocab_size=
+                    self.tokenizer.vocab_size
             )
 
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=8e-4,
-                weight_decay=0.01,
-            )
+        self.model = VerdantCore(
+            cfg
+        )
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=3e-4,
+            betas=(0.9, 0.95),
+            weight_decay=0.01,
+        )
 
         self.model.load_state_dict(
             payload["model"]
@@ -199,20 +450,21 @@ class ModelStore:
             )
         )
 
-        self.best_val = payload.get(
-            "best_val"
+        self.best_validation = payload.get(
+            "best_validation"
         )
 
     def save(
         self,
-        path=None,
     ):
 
-        destination = Path(
-            path or self.path
+        temporary = (
+            self.path.with_suffix(
+                ".tmp"
+            )
         )
 
-        destination.parent.mkdir(
+        self.path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
@@ -230,33 +482,43 @@ class ModelStore:
                     "step":
                         self.step,
 
-                    "best_val":
-                        self.best_val,
+                    "best_validation":
+                        self.best_validation,
 
                     "config":
                         asdict(
                             self.model.cfg
                         ),
                 },
-                destination,
+                temporary,
             )
 
-    def parameter_count(self):
+            temporary.replace(
+                self.path
+            )
 
-        return sum(
-            parameter.numel()
-            for parameter
-            in self.model.parameters()
-        )
+    def parameter_count(
+        self,
+    ):
 
-    def snapshot(self):
+        with self.lock:
+
+            return sum(
+                parameter.numel()
+                for parameter
+                in self.model.parameters()
+            )
+
+    def snapshot(
+        self,
+    ):
 
         with self.lock:
 
             return {
-                name:
-                    tensor.detach().clone()
-                for name, tensor
+                key:
+                    value.detach().clone()
+                for key, value
                 in self.model.state_dict().items()
             }
 
@@ -266,7 +528,6 @@ class ModelStore:
     ):
 
         with self.lock:
-
             self.model.load_state_dict(
                 state
             )
