@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 
 USER_AGENT = (
-    "Verdant-1.0/learning-client"
+    "Verdant-1.0-research/1.0"
 )
 
 
@@ -25,7 +25,7 @@ def clean_text(
 
 def wiki_search(
     query: str,
-    limit: int = 12,
+    limit: int = 15,
 ):
 
     response = requests.get(
@@ -39,14 +39,15 @@ def wiki_search(
             "srlimit": limit,
         },
         headers={
-            "User-Agent": USER_AGENT
+            "User-Agent":
+                USER_AGENT
         },
         timeout=20,
     )
 
     response.raise_for_status()
 
-    results = []
+    output = []
 
     for item in (
         response.json()
@@ -54,22 +55,20 @@ def wiki_search(
         .get("search", [])
     ):
 
-        title = item["title"]
+        title = item[
+            "title"
+        ]
 
-        results.append(
+        output.append(
             {
                 "title": title,
-
-                "snippet": (
-                    BeautifulSoup(
-                        item.get(
-                            "snippet",
-                            "",
-                        ),
-                        "html.parser",
-                    ).get_text(" ")
-                ),
-
+                "snippet": BeautifulSoup(
+                    item.get(
+                        "snippet",
+                        "",
+                    ),
+                    "html.parser",
+                ).get_text(" "),
                 "url": (
                     "https://en.wikipedia.org/wiki/"
                     + quote(
@@ -82,18 +81,19 @@ def wiki_search(
             }
         )
 
-    return results
+    return output
 
 
 def fetch_page(
     url: str,
-    max_chars: int = 24000,
+    limit: int = 30000,
 ):
 
     response = requests.get(
         url,
         headers={
-            "User-Agent": USER_AGENT
+            "User-Agent":
+                USER_AGENT
         },
         timeout=25,
     )
@@ -117,7 +117,19 @@ def fetch_page(
 
     return clean_text(
         soup.get_text(" ")
-    )[:max_chars]
+    )[:limit]
+
+
+def _terms(
+    query: str,
+):
+
+    return set(
+        re.findall(
+            r"[a-z0-9]{3,}",
+            query.lower(),
+        )
+    )
 
 
 def relevance(
@@ -126,11 +138,8 @@ def relevance(
     snippet: str,
 ):
 
-    terms = set(
-        re.findall(
-            r"[a-z0-9]{3,}",
-            goal.lower(),
-        )
+    terms = _terms(
+        goal
     )
 
     text = (
@@ -139,11 +148,20 @@ def relevance(
         + snippet
     ).lower()
 
-    return sum(
-        1
-        for term in terms
-        if term in text
-    )
+    score = 0
+
+    for term in terms:
+
+        if term in text:
+            score += (
+                1
+                + min(
+                    3,
+                    len(term) / 5
+                )
+            )
+
+    return score
 
 
 def research_goal(
@@ -152,10 +170,8 @@ def research_goal(
     seen_titles=None,
 ):
 
-    seen_titles = (
-        seen_titles
-        if seen_titles is not None
-        else set()
+    seen_titles = set(
+        seen_titles or []
     )
 
     queries = [
@@ -163,7 +179,8 @@ def research_goal(
         f"{goal} fundamentals",
         f"{goal} concepts",
         f"{goal} examples",
-        f"{goal} tutorial",
+        f"{goal} explanation",
+        f"{goal} common mistakes",
     ]
 
     candidates = {}
@@ -172,22 +189,20 @@ def research_goal(
 
         try:
             hits = wiki_search(
-                query,
-                limit=15,
+                query
             )
-
         except Exception:
             continue
 
         for hit in hits:
 
-            key = (
+            title_key = (
                 hit["title"]
                 .strip()
                 .lower()
             )
 
-            if key in seen_titles:
+            if title_key in seen_titles:
                 continue
 
             score = relevance(
@@ -196,15 +211,17 @@ def research_goal(
                 hit["snippet"],
             )
 
-            previous = candidates.get(
-                key
+            old = candidates.get(
+                title_key
             )
 
             if (
-                previous is None
-                or score > previous[0]
+                old is None
+                or score > old[0]
             ):
-                candidates[key] = (
+                candidates[
+                    title_key
+                ] = (
                     score,
                     hit,
                 )
@@ -225,6 +242,7 @@ def research_goal(
             continue
 
         try:
+
             text = fetch_page(
                 hit["url"]
             )
@@ -239,11 +257,15 @@ def research_goal(
             {
                 **hit,
                 "text": text,
-                "relevance": score,
+                "relevance":
+                    score,
             }
         )
 
-        if len(documents) >= limit:
+        if (
+            len(documents)
+            >= limit
+        ):
             break
 
     return documents
