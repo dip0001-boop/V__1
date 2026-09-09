@@ -2,5 +2,4 @@ fastapi==0.115.14
 uvicorn[standard]==0.34.3
 requests==2.32.4
 beautifulsoup4==4.13.4
-numpy
-torch==2.14.0
+numpy==2.5.3
