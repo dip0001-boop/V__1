@@ -2,17 +2,24 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  >
 
   <title>Verdant-1.0</title>
 
-  <link rel="stylesheet" href="/static/styles.css">
+  <link
+    rel="stylesheet"
+    href="/static/styles.css"
+  >
 </head>
 
 <body>
   <div class="shell">
 
     <aside class="side">
+
       <div class="brand">
         <div class="logo">V</div>
 
@@ -22,18 +29,20 @@
         </div>
       </div>
 
-      <button id="new" type="button">
+      <button
+        id="new"
+        type="button"
+      >
         ＋ New chat
       </button>
 
       <div class="panel">
+
         <h3>Training</h3>
 
         <input
           id="goal"
-          type="text"
           placeholder="Goal — e.g. Learn C++"
-          autocomplete="off"
         >
 
         <label>
@@ -48,14 +57,17 @@
           >
         </label>
 
-        <button id="train" type="button">
+        <button
+          id="train"
+          type="button"
+        >
           Train Verdant
         </button>
 
         <button
           id="stop"
-          class="ghost"
           type="button"
+          class="ghost"
         >
           Stop
         </button>
@@ -63,30 +75,36 @@
         <div id="status">
           Idle
         </div>
+
       </div>
 
       <div class="modelinfo">
-        Model steps
+        Model steps:
         <b id="steps">0</b>
 
         <br>
 
-        Learned values
+        Learned values:
         <b id="params">—</b>
       </div>
+
     </aside>
 
     <main>
 
       <header>
+
         <div>
           <b>Verdant-1.0</b>
-          <small>Backend learned core</small>
+          <small>
+            Backend learned core
+          </small>
         </div>
 
         <span id="conn">
           ● connected
         </span>
+
       </header>
 
       <div id="chat"></div>
@@ -94,6 +112,7 @@
       <div class="composer">
 
         <div class="effort">
+
           <button
             type="button"
             data-e="lite"
@@ -115,34 +134,37 @@
           >
             MAX
           </button>
+
         </div>
 
         <div class="box">
+
           <textarea
             id="input"
             rows="1"
             placeholder="Message Verdant..."
-            autocomplete="off"
           ></textarea>
 
           <button
             id="send"
             type="button"
-            aria-label="Send message"
           >
             ↑
           </button>
+
         </div>
 
         <small>
-          Training and inference run on the backend.
+          Verdant runs on the backend.
         </small>
 
       </div>
+
     </main>
 
   </div>
 
   <script src="/static/app.js"></script>
+
 </body>
 </html>
