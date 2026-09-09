@@ -8,11 +8,14 @@ from bs4 import BeautifulSoup
 
 
 USER_AGENT = (
-    "Verdant-1.0-learning-research/1.0"
+    "Verdant-1.0/learning-client"
 )
 
 
-def clean_text(text: str) -> str:
+def clean_text(
+    text: str,
+) -> str:
+
     return re.sub(
         r"\s+",
         " ",
@@ -24,6 +27,7 @@ def wiki_search(
     query: str,
     limit: int = 12,
 ):
+
     response = requests.get(
         "https://en.wikipedia.org/w/api.php",
         params={
@@ -55,13 +59,17 @@ def wiki_search(
         results.append(
             {
                 "title": title,
-                "snippet": BeautifulSoup(
-                    item.get(
-                        "snippet",
-                        "",
-                    ),
-                    "html.parser",
-                ).get_text(" "),
+
+                "snippet": (
+                    BeautifulSoup(
+                        item.get(
+                            "snippet",
+                            "",
+                        ),
+                        "html.parser",
+                    ).get_text(" ")
+                ),
+
                 "url": (
                     "https://en.wikipedia.org/wiki/"
                     + quote(
@@ -81,6 +89,7 @@ def fetch_page(
     url: str,
     max_chars: int = 24000,
 ):
+
     response = requests.get(
         url,
         headers={
@@ -111,11 +120,12 @@ def fetch_page(
     )[:max_chars]
 
 
-def relevance_score(
+def relevance(
     goal: str,
     title: str,
     snippet: str,
 ):
+
     terms = set(
         re.findall(
             r"[a-z0-9]{3,}",
@@ -129,9 +139,6 @@ def relevance_score(
         + snippet
     ).lower()
 
-    if not terms:
-        return 0
-
     return sum(
         1
         for term in terms
@@ -142,47 +149,54 @@ def relevance_score(
 def research_goal(
     goal: str,
     limit: int = 12,
-    seen_titles: set[str] | None = None,
+    seen_titles=None,
 ):
-    seen_titles = seen_titles or set()
 
-    # Search several formulations so one poor result set
-    # doesn't define the entire learning session.
+    seen_titles = (
+        seen_titles
+        if seen_titles is not None
+        else set()
+    )
+
     queries = [
         goal,
         f"{goal} fundamentals",
-        f"{goal} tutorial concepts",
+        f"{goal} concepts",
         f"{goal} examples",
+        f"{goal} tutorial",
     ]
 
-    all_hits = {}
+    candidates = {}
 
     for query in queries:
 
         try:
             hits = wiki_search(
                 query,
-                max(12, limit),
+                limit=15,
             )
+
         except Exception:
             continue
 
         for hit in hits:
 
-            key = hit[
-                "title"
-            ].strip().lower()
+            key = (
+                hit["title"]
+                .strip()
+                .lower()
+            )
 
             if key in seen_titles:
                 continue
 
-            score = relevance_score(
+            score = relevance(
                 goal,
                 hit["title"],
                 hit["snippet"],
             )
 
-            previous = all_hits.get(
+            previous = candidates.get(
                 key
             )
 
@@ -190,13 +204,13 @@ def research_goal(
                 previous is None
                 or score > previous[0]
             ):
-                all_hits[key] = (
+                candidates[key] = (
                     score,
                     hit,
                 )
 
     ranked = sorted(
-        all_hits.values(),
+        candidates.values(),
         key=lambda item: (
             -item[0],
             item[1]["title"],
@@ -214,6 +228,7 @@ def research_goal(
             text = fetch_page(
                 hit["url"]
             )
+
         except Exception:
             continue
 
