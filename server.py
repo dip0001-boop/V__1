@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 from pathlib import Path
 
@@ -10,9 +9,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from evaluator import Evaluator
 from memory import MemoryStore
 from model import ModelStore
 from summary import summarize
+from tokenizer import LearnedTokenizer
 from trainer import Trainer
 
 
@@ -21,33 +22,89 @@ app = FastAPI(
     version="1.0.0",
 )
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(
+    __file__
+).resolve().parent
+
+
+# ============================================================
+# Tokenizer
+# ============================================================
+
+tokenizer = LearnedTokenizer(
+    ROOT / "verdant_tokenizer.json"
+)
+
+
+# ============================================================
+# Model
+# ============================================================
+
+model_path = (
+    ROOT / "verdant_state.pt"
+)
+
+store = ModelStore(
+    model_path,
+    tokenizer,
+)
+
+
+# ============================================================
+# Memory
+# ============================================================
+
+memory = MemoryStore(
+    ROOT / "verdant_memory.json"
+)
+
+
+# ============================================================
+# Trainer
+# ============================================================
+
+trainer = Trainer(
+    store,
+    memory,
+)
+
+
+# ============================================================
+# Static frontend
+# ============================================================
 
 app.mount(
     "/static",
-    StaticFiles(directory=ROOT),
+    StaticFiles(
+        directory=ROOT
+    ),
     name="static",
 )
 
-store = ModelStore(ROOT / "verdant_state.pt")
-memory = MemoryStore(ROOT / "verdant_memory.json")
-trainer = Trainer(store, memory)
 
+# ============================================================
+# Requests
+# ============================================================
 
 class ChatRequest(BaseModel):
+
     message: str = Field(
         min_length=1,
         max_length=12000,
     )
+
     chat_id: str | None = None
+
     effort: str = "medium"
 
 
 class TrainRequest(BaseModel):
+
     goal: str = Field(
         min_length=2,
         max_length=300,
     )
+
     minutes: float = Field(
         default=20,
         ge=1,
@@ -55,68 +112,109 @@ class TrainRequest(BaseModel):
     )
 
 
-@app.get("/", include_in_schema=False)
-@app.head("/", include_in_schema=False)
+# ============================================================
+# Frontend
+# ============================================================
+
+@app.get(
+    "/",
+    include_in_schema=False,
+)
+@app.head(
+    "/",
+    include_in_schema=False,
+)
 def index():
-    path = ROOT / "index.html"
 
-    if not path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="index.html not found",
-        )
-
-    return FileResponse(path)
-
-
-@app.get("/api/health")
-def health():
-    return {
-        "ok": True,
-        "model_step": store.step,
-        "parameters": store.parameter_count(),
-        "training": trainer.snapshot(),
-    }
-
-
-@app.get("/api/status")
-def status():
-    return {
-        "training": trainer.snapshot(),
-        "model_step": store.step,
-        "parameters": store.parameter_count(),
-    }
-
-
-def effort_config(effort: str):
-    configs = {
-        "lite": {
-            "max_new": 96,
-            "temperature": 0.95,
-        },
-        "medium": {
-            "max_new": 160,
-            "temperature": 0.85,
-        },
-        "max": {
-            "max_new": 256,
-            "temperature": 0.72,
-        },
-    }
-
-    return configs.get(
-        (effort or "medium").lower(),
-        configs["medium"],
+    return FileResponse(
+        ROOT / "index.html"
     )
 
 
-def sample(
-    prompt: str,
-    max_new: int,
-    temperature: float,
-) -> str:
+# ============================================================
+# Health
+# ============================================================
 
-    tokenizer = store.tokenizer
+@app.get(
+    "/api/health"
+)
+def health():
+
+    return {
+        "ok": True,
+        "step": store.step,
+        "parameters":
+            store.parameter_count(),
+        "vocab_size":
+            store.model.cfg.vocab_size,
+        "context":
+            store.model.cfg.context,
+    }
+
+
+@app.get(
+    "/api/status"
+)
+def status():
+
+    return {
+        "training":
+            trainer.snapshot(),
+
+        "model_step":
+            store.step,
+
+        "parameters":
+            store.parameter_count(),
+
+        "vocab_size":
+            store.model.cfg.vocab_size,
+
+        "context":
+            store.model.cfg.context,
+    }
+
+
+# ============================================================
+# Sampling
+# ============================================================
+
+def _settings(
+    effort,
+):
+
+    return {
+        "lite":
+            (
+                96,
+                0.95,
+            ),
+
+        "medium":
+            (
+                180,
+                0.85,
+            ),
+
+        "max":
+            (
+                300,
+                0.72,
+            ),
+    }.get(
+        (effort or "medium").lower(),
+        (
+            180,
+            0.85,
+        ),
+    )
+
+
+def _sample(
+    prompt,
+    max_new,
+    temperature,
+):
 
     ids = tokenizer.encode(
         prompt,
@@ -124,119 +222,171 @@ def sample(
     )
 
     if not ids:
-        ids = [32]
+        ids = [
+            tokenizer.token_to_id[
+                "<bos>"
+            ]
+        ]
 
-    x = torch.tensor(
+    current = torch.tensor(
         [ids],
         dtype=torch.long,
     )
 
     generated = []
-    hidden = None
+
+    eos = tokenizer.token_to_id.get(
+        "<eos>"
+    )
 
     store.model.eval()
 
     with torch.no_grad():
 
-        _, hidden = store.model(
-            x,
-            hidden,
-        )
+        for _ in range(
+            max_new
+        ):
 
-        last = x[:, -1:]
-
-        for _ in range(max_new):
-
-            logits, hidden = store.model(
-                last,
-                hidden,
+            logits = (
+                store.model(
+                    current[
+                        :,
+                        -store.model.cfg.context:
+                    ]
+                )
             )
 
-            logits = logits[:, -1, :]
-
-            logits = logits / max(
-                0.25,
-                temperature,
+            next_logits = (
+                logits[
+                    :,
+                    -1,
+                    :
+                ]
+                / max(
+                    0.25,
+                    temperature,
+                )
             )
 
-            probabilities = torch.softmax(
-                logits,
-                dim=-1,
+            probabilities = (
+                torch.softmax(
+                    next_logits,
+                    dim=-1,
+                )
             )
 
-            values, indices = torch.sort(
-                probabilities,
-                descending=True,
+            values, indices = (
+                torch.sort(
+                    probabilities,
+                    descending=True,
+                )
             )
 
-            cumulative = torch.cumsum(
-                values,
-                dim=-1,
+            cumulative = (
+                torch.cumsum(
+                    values,
+                    dim=-1,
+                )
             )
 
-            keep = cumulative <= 0.92
-            keep[..., 0] = True
-
-            values = values * keep
-
-            denominator = values.sum(
-                dim=-1,
-                keepdim=True,
+            keep = (
+                cumulative
+                <= 0.92
             )
 
-            values = values / denominator
+            keep[
+                ...,
+                0
+            ] = True
 
-            picked = torch.multinomial(
-                values,
-                1,
+            values = (
+                values
+                * keep
             )
 
-            next_token = indices.gather(
-                -1,
-                picked,
+            values = (
+                values
+                / values.sum(
+                    dim=-1,
+                    keepdim=True,
+                )
+            )
+
+            picked = (
+                torch.multinomial(
+                    values,
+                    1,
+                )
+            )
+
+            token = (
+                indices.gather(
+                    -1,
+                    picked,
+                )
             )
 
             token_id = int(
-                next_token.item()
+                token.item()
             )
+
+            if (
+                eos is not None
+                and token_id == eos
+            ):
+                break
 
             generated.append(
                 token_id
             )
 
-            last = next_token
+            current = torch.cat(
+                [
+                    current,
+                    token,
+                ],
+                dim=1,
+            )
 
     return tokenizer.decode(
         generated
     ).strip()
 
 
-@app.post("/api/chat")
-def chat(request: ChatRequest):
+# ============================================================
+# Chat
+# ============================================================
+
+@app.post(
+    "/api/chat"
+)
+def chat(
+    request: ChatRequest,
+):
 
     chat_id = (
         request.chat_id
         or str(uuid.uuid4())
     )
 
-    conversation = memory.chat(
-        chat_id
+    conversation = (
+        memory.chat(
+            chat_id
+        )
     )
 
-    recent = conversation[
-        "messages"
-    ][-10:]
+    recent = (
+        conversation[
+            "messages"
+        ][-12:]
+    )
 
-    context_parts = []
-
-    for message in recent:
-        context_parts.append(
+    context = "\n".join(
+        (
             f"{message['role'].title()}: "
             f"{message['content']}"
         )
-
-    context = "\n".join(
-        context_parts
+        for message in recent
     )
 
     memory.add_message(
@@ -245,8 +395,10 @@ def chat(request: ChatRequest):
         request.message,
     )
 
-    settings = effort_config(
-        request.effort
+    max_new, temperature = (
+        _settings(
+            request.effort
+        )
     )
 
     prompt = (
@@ -257,16 +409,21 @@ def chat(request: ChatRequest):
     )
 
     try:
-        answer = sample(
+
+        answer = _sample(
             prompt,
-            settings["max_new"],
-            settings["temperature"],
+            max_new,
+            temperature,
         )
 
     except Exception as exc:
+
         raise HTTPException(
             status_code=500,
-            detail=f"Inference failed: {exc}",
+            detail=(
+                f"Inference failed: "
+                f"{exc}"
+            ),
         ) from exc
 
     memory.add_message(
@@ -275,8 +432,10 @@ def chat(request: ChatRequest):
         answer,
     )
 
-    updated = memory.chat(
-        chat_id
+    updated = (
+        memory.chat(
+            chat_id
+        )
     )
 
     chat_summary = summarize(
@@ -289,41 +448,111 @@ def chat(request: ChatRequest):
     )
 
     return {
-        "chat_id": chat_id,
-        "response": answer,
-        "summary": chat_summary,
-        "effort": request.effort,
-        "training_step": store.step,
+        "chat_id":
+            chat_id,
+
+        "response":
+            answer,
+
+        "summary":
+            chat_summary,
+
+        "effort":
+            request.effort,
+
+        "training_step":
+            store.step,
     }
 
 
-@app.post("/api/train/start")
+# ============================================================
+# Training
+# ============================================================
+
+@app.post(
+    "/api/train/start"
+)
 def start_training(
     request: TrainRequest,
 ):
+
     try:
+
+        # Build tokenizer vocabulary on first training run.
+        if tokenizer.vocab_size < 512:
+
+            seed_text = (
+                " ".join(
+                    memory.data.get(
+                        "learning",
+                        {},
+                    ).get(
+                        "replay",
+                        [],
+                    )
+                    and [
+                        str(item)
+                        for item in
+                        memory.data[
+                            "learning"
+                        ][
+                            "replay"
+                        ]
+                    ]
+                    or []
+                )
+            )
+
+            if not seed_text:
+
+                seed_text = (
+                    request.goal
+                    + " "
+                    + "learning "
+                    + "language "
+                    + "reasoning "
+                    + "conversation "
+                    + "knowledge "
+                ) * 100
+
+            tokenizer.build(
+                seed_text,
+                max_vocab=8192,
+            )
+
+            # Tokenizer shape must match a fresh model.
+            store.model, store.optimizer = (
+                store._new_model()
+            )
+
         trainer.start(
             request.goal,
             request.minutes,
         )
 
+        return {
+            "ok": True,
+            "goal":
+                request.goal,
+            "minutes":
+                request.minutes,
+        }
+
     except Exception as exc:
+
         raise HTTPException(
             status_code=409,
             detail=str(exc),
         ) from exc
 
-    return {
-        "ok": True,
-        "goal": request.goal,
-        "minutes": request.minutes,
-    }
 
-
-@app.post("/api/train/stop")
+@app.post(
+    "/api/train/stop"
+)
 def stop_training():
+
     trainer.halt()
 
     return {
-        "ok": True,
+        "ok": True
     }
