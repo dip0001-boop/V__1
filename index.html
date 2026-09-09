@@ -1,7 +1,9 @@
 <!doctype html>
 <html lang="en">
 <head>
+
   <meta charset="utf-8">
+
   <meta
     name="viewport"
     content="width=device-width,initial-scale=1"
@@ -13,20 +15,33 @@
     rel="stylesheet"
     href="/static/styles.css"
   >
+
 </head>
 
 <body>
+
   <div class="shell">
 
     <aside class="side">
 
       <div class="brand">
-        <div class="logo">V</div>
+
+        <div class="logo">
+          V
+        </div>
 
         <div>
-          <b>Verdant-1.0</b>
-          <span>learned intelligence</span>
+
+          <b>
+            Verdant-1.0
+          </b>
+
+          <span>
+            learned intelligence
+          </span>
+
         </div>
+
       </div>
 
       <button
@@ -38,14 +53,19 @@
 
       <div class="panel">
 
-        <h3>Training</h3>
+        <h3>
+          Training
+        </h3>
 
         <input
           id="goal"
+          type="text"
           placeholder="Goal — e.g. Learn C++"
+          autocomplete="off"
         >
 
         <label>
+
           Minutes
 
           <input
@@ -55,6 +75,7 @@
             max="120"
             value="20"
           >
+
         </label>
 
         <button
@@ -72,20 +93,29 @@
           Stop
         </button>
 
-        <div id="status">
+        <div
+          id="status"
+          class="status"
+        >
           Idle
         </div>
 
       </div>
 
       <div class="modelinfo">
+
         Model steps:
-        <b id="steps">0</b>
+        <b id="steps">
+          0
+        </b>
 
         <br>
 
         Learned values:
-        <b id="params">—</b>
+        <b id="params">
+          —
+        </b>
+
       </div>
 
     </aside>
@@ -95,10 +125,15 @@
       <header>
 
         <div>
-          <b>Verdant-1.0</b>
+
+          <b>
+            Verdant-1.0
+          </b>
+
           <small>
             Backend learned core
           </small>
+
         </div>
 
         <span id="conn">
@@ -148,6 +183,7 @@
           <button
             id="send"
             type="button"
+            aria-label="Send"
           >
             ↑
           </button>
@@ -155,7 +191,7 @@
         </div>
 
         <small>
-          Verdant runs on the backend.
+          Training and inference run on the backend.
         </small>
 
       </div>
