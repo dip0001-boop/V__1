@@ -11,6 +11,7 @@ class MemoryStore:
         self,
         path="verdant_memory.json",
     ):
+
         self.path = Path(path)
 
         self.lock = threading.RLock()
@@ -27,35 +28,47 @@ class MemoryStore:
         self._load()
 
     def _load(self):
+
         if not self.path.exists():
             return
 
         try:
+
             loaded = json.loads(
                 self.path.read_text(
-                    "utf-8"
+                    encoding="utf-8"
                 )
             )
 
-            self.data.update(
-                loaded
-            )
+            if isinstance(
+                loaded,
+                dict,
+            ):
+                self.data.update(
+                    loaded
+                )
 
         except Exception:
             pass
 
     def save(self):
+
         with self.lock:
+
             self.path.write_text(
                 json.dumps(
                     self.data,
                     ensure_ascii=False,
                     indent=2,
                 ),
-                "utf-8",
+                encoding="utf-8",
             )
 
-    def chat(self, chat_id):
+    def chat(
+        self,
+        chat_id,
+    ):
+
         return self.data[
             "chats"
         ].setdefault(
@@ -72,6 +85,7 @@ class MemoryStore:
         role,
         content,
     ):
+
         self.chat(
             chat_id
         )["messages"].append(
@@ -88,6 +102,7 @@ class MemoryStore:
         chat_id,
         summary,
     ):
+
         self.chat(
             chat_id
         )["summary"] = summary
@@ -99,6 +114,7 @@ class MemoryStore:
         chat_id,
         n=10,
     ):
+
         return self.chat(
             chat_id
         )["messages"][-n:]
