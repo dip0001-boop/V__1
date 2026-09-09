@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 
-def summarize(messages):
+def summarize(
+    messages,
+):
+
     if not messages:
         return ""
 
     parts = []
 
     for message in messages[-12:]:
-        content = " ".join(
+
+        text = " ".join(
             (
                 message.get(
                     "content",
@@ -16,20 +20,23 @@ def summarize(messages):
                 )
                 or ""
             ).split()
-        )[:240]
+        )
 
-        if not content:
+        text = text[:240]
+
+        if not text:
             continue
 
         speaker = (
             "You"
-            if message.get("role")
-            == "user"
+            if message.get(
+                "role"
+            ) == "user"
             else "Verdant"
         )
 
         parts.append(
-            f"{speaker}: {content}"
+            f"{speaker}: {text}"
         )
 
     return " | ".join(
