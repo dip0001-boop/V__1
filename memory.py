@@ -12,16 +12,20 @@ class MemoryStore:
         path="verdant_memory.json",
     ):
 
-        self.path = Path(path)
+        self.path = Path(
+            path
+        )
 
-        self.lock = threading.RLock()
+        self.lock = (
+            threading.RLock()
+        )
 
         self.data = {
             "chats": {},
             "learning": {
                 "sessions": [],
-                "skills": {},
                 "seen_sources": [],
+                "replay": [],
             },
         }
 
@@ -55,13 +59,23 @@ class MemoryStore:
 
         with self.lock:
 
-            self.path.write_text(
+            temp = (
+                self.path.with_suffix(
+                    ".tmp"
+                )
+            )
+
+            temp.write_text(
                 json.dumps(
                     self.data,
                     ensure_ascii=False,
                     indent=2,
                 ),
                 encoding="utf-8",
+            )
+
+            temp.replace(
+                self.path
             )
 
     def chat(
@@ -109,12 +123,67 @@ class MemoryStore:
 
         self.save()
 
-    def recent_context(
+    def add_replay(
         self,
-        chat_id,
-        n=10,
+        example,
+        priority=1.0,
     ):
 
-        return self.chat(
-            chat_id
-        )["messages"][-n:]
+        learning = self.data[
+            "learning"
+        ]
+
+        learning.setdefault(
+            "replay",
+            []
+        )
+
+        learning[
+            "replay"
+        ].append(
+            {
+                "example":
+                    example,
+                "priority":
+                    float(priority),
+            }
+        )
+
+        # Keep persistent replay bounded.
+        learning[
+            "replay"
+        ] = learning[
+            "replay"
+        ][-2000:]
+
+    def replay_examples(
+        self,
+        maximum=256,
+    ):
+
+        replay = self.data[
+            "learning"
+        ].get(
+            "replay",
+            [],
+        )
+
+        if not replay:
+            return []
+
+        ordered = sorted(
+            replay,
+            key=lambda item:
+                item.get(
+                    "priority",
+                    1.0,
+                ),
+            reverse=True,
+        )
+
+        return [
+            item["example"]
+            for item in ordered[
+                :maximum
+            ]
+        ]
