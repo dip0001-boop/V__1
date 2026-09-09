@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import random
-import re
 
 import torch
 import torch.nn.functional as F
@@ -13,21 +12,26 @@ class Evaluator:
     def __init__(
         self,
         store,
+        memory=None,
     ):
         self.store = store
+        self.memory = memory
+
+    # =========================================================
+    # Language objective
+    # =========================================================
 
     def loss(
         self,
         examples,
-        maximum=48,
+        maximum=64,
     ):
-
         if not examples:
             return None
 
-        selected = examples[
-            :maximum
-        ]
+        selected = list(
+            examples[:maximum]
+        )
 
         self.store.model.eval()
 
@@ -37,10 +41,8 @@ class Evaluator:
 
             for example in selected:
 
-                ids = (
-                    self.store.tokenizer.encode(
-                        example
-                    )
+                ids = self.store.tokenizer.encode(
+                    example
                 )
 
                 if len(ids) < 4:
@@ -51,36 +53,33 @@ class Evaluator:
                 ]
 
                 x = torch.tensor(
-                    [
-                        ids[:-1]
-                    ],
+                    [ids[:-1]],
                     dtype=torch.long,
                 )
 
                 y = torch.tensor(
-                    [
-                        ids[1:]
-                    ],
+                    [ids[1:]],
                     dtype=torch.long,
                 )
 
-                logits = (
-                    self.store.model(x)
+                logits = self.store.model(
+                    x
                 )
 
-                value = (
-                    F.cross_entropy(
-                        logits.reshape(
-                            -1,
-                            logits.shape[-1],
-                        ),
-                        y.reshape(-1),
-                    )
+                value = F.cross_entropy(
+                    logits.reshape(
+                        -1,
+                        logits.shape[-1],
+                    ),
+                    y.reshape(-1),
                 )
 
-                values.append(
+                if math.isfinite(
                     float(value)
-                )
+                ):
+                    values.append(
+                        float(value)
+                    )
 
         if not values:
             return None
@@ -89,90 +88,180 @@ class Evaluator:
             values
         )
 
+    # =========================================================
+    # Improvement
+    # =========================================================
+
     def improvement(
         self,
         baseline,
         current,
     ):
-
         if (
             baseline is None
             or current is None
         ):
             return 0.0
 
-        return baseline - current
+        return (
+            baseline
+            - current
+        )
 
-    def score(
+    # =========================================================
+    # Persistent retention
+    # =========================================================
+
+    def retention_score(
         self,
-        baseline,
-        current,
+        maximum=64,
     ):
+        if self.memory is None:
+            return 0.0
 
-        change = self.improvement(
-            baseline,
-            current,
+        replay = (
+            self.memory.replay_examples(
+                maximum=maximum
+            )
         )
 
-        # This number is deliberately not called
-        # "understanding". It only measures held-out
-        # predictive improvement.
-        result = 0.5 + (
-            change / 4.0
+        if not replay:
+            return 0.0
+
+        value = self.loss(
+            replay,
+            maximum=maximum,
         )
 
-        return max(
-            0.0,
-            min(
-                1.0,
-                result,
-            ),
+        if value is None:
+            return 0.0
+
+        # Retention is tracked as predictive quality
+        # rather than a fabricated percentage.
+        #
+        # Lower loss => higher retention score.
+        #
+        # exp(-loss) is bounded in (0, 1] and does not
+        # claim semantic mastery.
+        return math.exp(
+            -max(
+                0.0,
+                value,
+            )
         )
 
-    @staticmethod
-    def generate_unseen_prompts(
+    # =========================================================
+    # Independent transfer-oriented evaluation
+    # =========================================================
+
+    def _concepts_from_documents(
+        self,
+        documents,
+    ):
+        concepts = []
+
+        for document in documents:
+
+            title = str(
+                document.get(
+                    "title",
+                    "",
+                )
+            ).strip()
+
+            text = str(
+                document.get(
+                    "text",
+                    "",
+                )
+            ).strip()
+
+            if not text:
+                continue
+
+            sentences = (
+                text.replace(
+                    "\n",
+                    " ",
+                ).split(".")
+            )
+
+            for sentence in sentences:
+
+                sentence = sentence.strip()
+
+                if len(sentence) >= 80:
+
+                    concepts.append(
+                        (
+                            title,
+                            sentence,
+                        )
+                    )
+
+        return concepts
+
+    def transfer_score(
+        self,
         goal,
-        concepts,
-        count=7,
+        documents,
+        validation_examples,
     ):
+        """
+        Measures whether the current model can predict
+        transformed observations that were not directly
+        optimized in the current update.
 
-        # These prompts are created from held-out concepts,
-        # not copied from training examples.
+        This deliberately does NOT ask the model to grade
+        itself.
+        """
+
+        concepts = (
+            self._concepts_from_documents(
+                documents
+            )
+        )
+
+        if not concepts:
+            return 0.0
+
         rng = random.Random(
             hash(goal) & 0xffffffff
         )
 
-        choices = list(
+        rng.shuffle(
             concepts
         )
 
-        rng.shuffle(
-            choices
+        selected = concepts[:8]
+
+        probes = []
+
+        for title, sentence in selected:
+
+            probes.append(
+                (
+                    f"Goal: {goal}\n"
+                    f"Topic: {title}\n"
+                    f"Observation: {sentence}\n"
+                    f"Prediction:"
+                )
+            )
+
+        # The probe loss is compared against the model's
+        # own fixed current predictive objective, not a
+        # generated self-score.
+        value = self.loss(
+            probes,
+            maximum=len(probes),
         )
 
-        prompts = []
+        if value is None:
+            return 0.0
 
-        for concept in choices:
-
-            prompts.append(
-                (
-                    "Explain this idea in your own words: "
-                    + concept
-                )
+        return math.exp(
+            -max(
+                0.0,
+                value,
             )
-
-            if len(prompts) >= count:
-                break
-
-        while len(prompts) < count:
-
-            prompts.append(
-                (
-                    "What is an important idea "
-                    f"about {goal}?"
-                )
-            )
-
-        return prompts[
-            :count
-        ]
+        )
