@@ -19,12 +19,6 @@ class ModelConfig:
 
 
 class VerdantCore(nn.Module):
-    """
-    Verdant's learned language core.
-
-    Intelligence comes from learned numerical state.
-    This class does not contain question->answer rules.
-    """
 
     def __init__(
         self,
@@ -70,20 +64,23 @@ class VerdantCore(nn.Module):
         x,
         hidden=None,
     ):
-        embeddings = self.embedding(x)
 
-        embeddings = torch.tanh(
+        embedded = self.embedding(x)
+
+        embedded = torch.tanh(
             self.input_projection(
-                embeddings
+                embedded
             )
         )
 
         states, hidden = self.rnn(
-            embeddings,
+            embedded,
             hidden,
         )
 
-        states = self.norm(states)
+        states = self.norm(
+            states
+        )
 
         logits = self.output_projection(
             states
@@ -93,12 +90,6 @@ class VerdantCore(nn.Module):
 
 
 class ByteTokenizer:
-    """
-    UTF-8 byte representation.
-
-    No <unk> token.
-    Every UTF-8 input is representable.
-    """
 
     vocab_size = 256
 
@@ -107,7 +98,8 @@ class ByteTokenizer:
         text: str,
         max_len: int | None = None,
     ):
-        values = list(
+
+        data = list(
             text.encode(
                 "utf-8",
                 errors="replace",
@@ -115,14 +107,12 @@ class ByteTokenizer:
         )
 
         if max_len is not None:
-            values = values[-max_len:]
+            data = data[-max_len:]
 
-        return values
+        return data
 
-    def decode(
-        self,
-        ids,
-    ):
+    def decode(self, ids):
+
         return bytes(
             int(i) % 256
             for i in ids
@@ -133,11 +123,14 @@ class ByteTokenizer:
 
 
 class ModelStore:
+
     def __init__(
         self,
-        path: str | Path = "verdant_state.pt",
+        path="verdant_state.pt",
     ):
+
         self.path = Path(path)
+
         self.lock = threading.RLock()
 
         self.tokenizer = ByteTokenizer()
@@ -151,11 +144,13 @@ class ModelStore:
         )
 
         self.step = 0
+
         self.best_val = None
 
         self._load()
 
     def _load(self):
+
         if not self.path.exists():
             return
 
@@ -164,14 +159,14 @@ class ModelStore:
             map_location="cpu",
         )
 
-        config_data = payload.get(
+        config = payload.get(
             "config"
         )
 
-        if config_data:
+        if config:
             self.model = VerdantCore(
                 ModelConfig(
-                    **config_data
+                    **config
                 )
             )
 
@@ -210,8 +205,9 @@ class ModelStore:
 
     def save(
         self,
-        path: str | Path | None = None,
+        path=None,
     ):
+
         destination = Path(
             path or self.path
         )
@@ -222,35 +218,55 @@ class ModelStore:
         )
 
         with self.lock:
+
             torch.save(
                 {
-                    "model": self.model.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "step": self.step,
-                    "best_val": self.best_val,
-                    "config": asdict(
-                        self.model.cfg
-                    ),
+                    "model":
+                        self.model.state_dict(),
+
+                    "optimizer":
+                        self.optimizer.state_dict(),
+
+                    "step":
+                        self.step,
+
+                    "best_val":
+                        self.best_val,
+
+                    "config":
+                        asdict(
+                            self.model.cfg
+                        ),
                 },
                 destination,
             )
 
-    def parameter_count(self) -> int:
+    def parameter_count(self):
+
         return sum(
             parameter.numel()
-            for parameter in self.model.parameters()
+            for parameter
+            in self.model.parameters()
         )
 
     def snapshot(self):
+
         with self.lock:
+
             return {
-                key: value.detach().clone()
-                for key, value
+                name:
+                    tensor.detach().clone()
+                for name, tensor
                 in self.model.state_dict().items()
             }
 
-    def restore(self, state):
+    def restore(
+        self,
+        state,
+    ):
+
         with self.lock:
+
             self.model.load_state_dict(
                 state
             )
